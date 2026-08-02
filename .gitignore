@@ -1,0 +1,62 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+*.egg-link
+.installed.cfg
+lib/
+lib64/
+
+# ── Virtual Environments ────────────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ── Secrets & Keys (NEVER COMMIT THESE) ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+
+# ── IDE / Editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs & Databases ────────────────────────────────────────────────────────
+*.log
+*.sqlite
+*.db
+
+# ── OS Files ────────────────────────────────────────────────────────────────
+.DS_Store
+Desktop.ini
+
+# ── Flask / Gunicorn ────────────────────────────────────────────────────────
+instance/
+.webassets-cache
+
+# ── Testing ─────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
