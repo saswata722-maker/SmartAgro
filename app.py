@@ -35,7 +35,6 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
-NINJA_API_KEY       = os.getenv("NINJA_API_KEY", "")  # no longer used by /api/market (kept for backward-compat only)
 DEBUG_MODE          = os.getenv("FLASK_DEBUG", "0") == "1"
 
 _translation_cache = {}
@@ -50,7 +49,6 @@ LANG_NAMES = {
 
 print(f"[AgroSmart] Groq key:    {'OK' if GROQ_API_KEY else 'MISSING'}")
 print(f"[AgroSmart] Weather key: {'OK' if OPENWEATHER_API_KEY else 'MISSING'}")
-print(f"[AgroSmart] Ninja key:   {'OK' if NINJA_API_KEY else 'MISSING'}")
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -85,25 +83,14 @@ def get_weather():
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid coordinates"}), 400
 
-    if not OPENWEATHER_API_KEY:
-        print("[Weather] Blocked: OPENWEATHER_API_KEY is missing from .env")
-        return jsonify({"error": "Weather service is not configured on the server (missing OPENWEATHER_API_KEY in .env)."}), 500
-
     try:
         current_resp  = requests.get("https://api.openweathermap.org/data/2.5/weather",
             params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric"}, timeout=10)
         forecast_resp = requests.get("https://api.openweathermap.org/data/2.5/forecast",
             params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "cnt": 56}, timeout=10)
 
-        if current_resp.status_code in (401, 403):
-            print(f"[Weather] OpenWeather rejected the API key ({current_resp.status_code}): {current_resp.text}")
-            return jsonify({"error": "Weather API key was rejected by OpenWeatherMap (invalid, not yet activated, or wrong plan). Check OPENWEATHER_API_KEY in .env."}), 500
-        if current_resp.status_code == 429:
-            print(f"[Weather] OpenWeather rate limit hit: {current_resp.text}")
-            return jsonify({"error": "Weather API rate limit reached. Please try again in a moment."}), 500
         if current_resp.status_code != 200:
-            print(f"[Weather] OpenWeather error {current_resp.status_code}: {current_resp.text}")
-            return jsonify({"error": f"Weather API error ({current_resp.status_code}): {current_resp.text}"}), 500
+            return jsonify({"error": f"Weather API error: {current_resp.text}"}), 500
         if forecast_resp.status_code != 200:
             print(f"[Weather] Forecast API error: {forecast_resp.text}")
 
@@ -150,12 +137,6 @@ def get_weather():
             },
             "forecast": forecast_list
         })
-    except requests.exceptions.ConnectionError as e:
-        print(f"[Weather error] Connection failed: {e}")
-        return jsonify({"error": "Could not reach the weather service (network/connection error). If this is a hosted server, check outbound network access; note this app forces IPv4-only outbound connections near the top of app.py, which can itself cause this on some hosts."}), 500
-    except requests.exceptions.Timeout as e:
-        print(f"[Weather error] Timeout: {e}")
-        return jsonify({"error": "Weather service timed out. Please try again."}), 500
     except Exception as e:
         print(f"[Weather error] {e}")
         return jsonify({"error": str(e)}), 500
