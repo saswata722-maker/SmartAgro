@@ -21,6 +21,9 @@ import os
 import json
 import re
 import time
+import base64
+import hashlib
+import difflib
 import threading
 import concurrent.futures
 from datetime import datetime, timedelta
@@ -36,6 +39,27 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
 DEBUG_MODE          = os.getenv("FLASK_DEBUG", "0") == "1"
+
+# ── Diagnosis QA logging ─────────────────────────────────────────────────
+# Every diagnosis (image + full model output, from every ensemble pass) is
+# persisted here so a human can spot-check the AI against the real photo
+# later. This is the "proof of accuracy" pipeline: without stored
+# input/output pairs there is nothing to audit or compute real accuracy
+# metrics from, no matter what confidence number the model reports.
+DIAGNOSIS_LOG_DIR    = os.path.join(basedir, "diagnosis_logs")
+DIAGNOSIS_IMAGES_DIR = os.path.join(DIAGNOSIS_LOG_DIR, "images")
+DIAGNOSIS_LOG_PATH   = os.path.join(DIAGNOSIS_LOG_DIR, "log.jsonl")
+os.makedirs(DIAGNOSIS_IMAGES_DIR, exist_ok=True)
+_diagnosis_log_lock = threading.Lock()
+
+# Number of independent diagnosis passes to run and cross-check per image.
+# If `vision_models` (defined near the /api/diagnose route below) only has
+# one production-viable entry, this runs that same model twice at different
+# temperatures as a self-consistency check. The moment Groq exposes a
+# second distinct vision model on the general tier, just add it to
+# `vision_models` and these passes automatically become a true multi-model
+# ensemble with zero other code changes.
+ENSEMBLE_PASSES = 2
 
 _translation_cache = {}
 
@@ -850,6 +874,15 @@ MAX_IMAGE_B64_LEN = 2 * 1024 * 1024
 _diagnose_rate = {}
 DIAGNOSE_LIMIT  = 10
 
+# Vision-capable models tried per ensemble pass. Today Groq only has one
+# production-viable multimodal model on the general tier (see the note by
+# ENSEMBLE_PASSES above) — meta-llama/llama-4-scout-17b-16e-instruct was
+# deprecated June 17, 2026. Add a second entry here as soon as one exists;
+# no other code needs to change.
+vision_models = [
+    "qwen/qwen3.6-27b",
+]
+
 
 def _is_rate_limited_diagnose(ip: str) -> bool:
     now = datetime.now().timestamp()
@@ -859,6 +892,129 @@ def _is_rate_limited_diagnose(ip: str) -> bool:
         return True
     _diagnose_rate[ip].append(now)
     return False
+
+
+# ── Step 0: cheap pre-classifier ─────────────────────────────────────────
+def ai_is_crop_image(image_b64):
+    """Fast, low-token sanity check BEFORE running the full diagnosis
+    prompt: does this photo actually show a plant/crop part? Without this,
+    the main prompt will happily hallucinate a plausible-sounding disease
+    name for a photo of a hand, a sack of grain, or a selfie — which is
+    worse than useless for a farmer trying to protect a crop.
+    Fails OPEN (assumes "yes, it's a plant") on any error/timeout, so a
+    flaky classifier call never blocks a genuine diagnosis."""
+    if not GROQ_API_KEY:
+        return True, None
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": vision_models[0],
+        "messages": [
+            {"role": "system", "content": "You classify images. Return ONLY valid JSON, nothing else."},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": (
+                    "Is this photo of a plant, crop, leaf, stem, fruit, or root — "
+                    "the kind of close-up photo a farmer would take to check a crop for "
+                    "disease? Answer false for people, animals, food dishes, documents, "
+                    "landscapes with no visible plant detail, or anything unrelated.\n"
+                    'Respond ONLY with JSON: {"is_plant": true or false, "reason": "one short phrase"}'
+                )}
+            ]}
+        ],
+        "temperature": 0,
+        "max_tokens": 100,
+        "reasoning_effort": "none",
+    }
+    try:
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                              headers=headers, json=body, timeout=15)
+        if resp.status_code != 200:
+            return True, None  # fail open — don't block a real diagnosis on a classifier hiccup
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        parsed = json.loads(match.group() if match else cleaned)
+        return bool(parsed.get("is_plant", True)), parsed.get("reason")
+    except Exception as e:
+        print(f"[PreClassifier] error: {e}")
+        return True, None  # fail open
+
+
+# ── Ensemble helpers ──────────────────────────────────────────────────────
+def _run_vision_pass(image_b64, prompt, sys_prompt, model, temperature):
+    """Run one diagnosis pass against one model and return the parsed JSON,
+    or None if that pass failed for any reason (caller decides how many
+    successful passes it needs)."""
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": prompt}
+            ]}
+        ],
+        "temperature": temperature,
+        "max_tokens": 1400,
+        "reasoning_effort": "none",  # skip <think> mode so JSON lands directly in content
+    }
+    resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers=headers, json=body, timeout=45)
+    if resp.status_code != 200:
+        return None
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
+        return None
+    return json.loads(match.group())
+
+
+def _diseases_agree(name_a, name_b):
+    """Fuzzy-match two disease name strings so small phrasing differences
+    between passes ('Late Blight' vs 'Late blight disease') still count as
+    agreement, while genuinely different diagnoses are correctly flagged as
+    a disagreement."""
+    if not name_a or not name_b:
+        return False
+    a, b = name_a.strip().lower(), name_b.strip().lower()
+    if a == b:
+        return True
+    if "healthy" in a and "healthy" in b:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.6
+
+
+# ── QA logging: store every image + result for human spot-checking ──────
+def _save_diagnosis_image(image_b64, record_id):
+    """Persist the uploaded image next to its diagnosis record so a
+    reviewer can see exactly what the model saw. Returns the saved
+    filename, or None on failure (non-fatal — logging never blocks the
+    response the farmer is waiting on)."""
+    try:
+        raw = base64.b64decode(image_b64)
+        img_hash = hashlib.sha256(raw).hexdigest()[:12]
+        filename = f"{record_id}_{img_hash}.jpg"
+        with open(os.path.join(DIAGNOSIS_IMAGES_DIR, filename), "wb") as f:
+            f.write(raw)
+        return filename
+    except Exception as e:
+        print(f"[DiagnosisLog] Could not save image: {e}")
+        return None
+
+
+def _log_diagnosis(record):
+    """Append one diagnosis record (image ref + every ensemble pass' raw
+    output + the merged final answer) to a JSONL audit log. This is the
+    data a human reviewer or a future accuracy benchmark would need —
+    without it there is no way to check the model against reality."""
+    try:
+        with _diagnosis_log_lock:
+            with open(DIAGNOSIS_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[DiagnosisLog] Could not write log entry: {e}")
 
 
 @app.route("/api/diagnose", methods=["POST"])
@@ -878,6 +1034,16 @@ def diagnose_crop():
         return jsonify({"error": "No image data received"}), 400
     if len(image_b64) > MAX_IMAGE_B64_LEN:
         return jsonify({"error": "Image too large. Please use an image under 1 MB."}), 413
+
+    # ── Step 1: cheap pre-classifier — reject non-crop photos early ─────
+    is_plant, reject_reason = ai_is_crop_image(image_b64)
+    if not is_plant:
+        return jsonify({
+            "error": "not_a_plant",
+            "message": "This doesn't look like a photo of a plant, leaf, stem, fruit, or root.",
+            "detail": reject_reason,
+        }), 422
+
     lang_name = LANG_NAMES.get(lang, "")
     if lang != "en" and lang_name:
         lang_instruction = (
@@ -903,49 +1069,204 @@ Respond ONLY with valid JSON, no markdown or backticks:
   "recovery_timeline": "Weeks for recovery"
 }}{lang_instruction}"""
 
-    vision_models = [
-        "qwen/qwen3.6-27b",
-    ]
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    sys_prompt = "Expert plant pathologist. Return ONLY valid JSON."
+    if lang != "en" and lang_name:
+        sys_prompt += f" All free-text values must be in {lang_name}."
 
-    for model in vision_models:
+    # ── Step 2: ensemble / self-consistency passes ──────────────────────
+    # Cycling through `vision_models` means this automatically becomes a
+    # true multi-model ensemble the moment a second entry is added there;
+    # with a single model configured (today's reality) it instead runs
+    # that model twice at different temperatures as a self-consistency
+    # cross-check, which is the honest equivalent given only one
+    # production-viable Groq vision model currently exists.
+    pass_temperatures = [0.2, 0.6, 0.9]
+    results, models_used = [], []
+    for i in range(ENSEMBLE_PASSES):
+        model = vision_models[i % len(vision_models)]
+        temp  = pass_temperatures[i % len(pass_temperatures)]
         try:
-            sys_prompt = "Expert plant pathologist. Return ONLY valid JSON."
-            if lang != "en" and lang_name:
-                sys_prompt += f" All free-text values must be in {lang_name}."
-
-            body = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                        {"type": "text", "text": prompt}
-                    ]}
-                ],
-                "temperature": 0.2,
-                "max_tokens":  1400,
-                "reasoning_effort": "none",  # skip <think> mode so JSON lands directly in content
-            }
-            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=45)
-            if resp.status_code in (429, 500, 503):
-                continue
-            if resp.status_code != 200:
-                continue
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-                # Tag with the language so the frontend can skip the
-                # redundant /api/translate-diagnosis-result round-trip.
-                result["_lang"] = lang
-                return jsonify(result)
+            parsed = _run_vision_pass(image_b64, prompt, sys_prompt, model, temp)
+            if parsed and parsed.get("disease"):
+                results.append(parsed)
+                models_used.append(model)
         except Exception as e:
-            print(f"[Diagnose] {model}: {e}")
+            print(f"[Diagnose] pass {i} ({model}) failed: {e}")
             continue
 
-    return jsonify({"error": "All vision models failed. Check your GROQ_API_KEY in .env"}), 500
+    if not results:
+        return jsonify({"error": "All vision models failed. Check your GROQ_API_KEY in .env"}), 500
+
+    # ── Step 3: merge / vote across passes ───────────────────────────────
+    primary = max(results, key=lambda r: r.get("confidence", 0))
+    others  = [r for r in results if r is not primary]
+
+    agreement = True
+    alternate_diagnosis = None
+    if others:
+        agree_flags = [_diseases_agree(primary.get("disease", ""), o.get("disease", "")) for o in others]
+        agreement = all(agree_flags)
+        if agreement:
+            # Independent passes landed on the same diagnosis — that
+            # agreement is itself evidence, so average + slightly boost
+            # confidence (capped at 99, never claim certainty).
+            confidences = [r.get("confidence", 0) for r in results]
+            primary["confidence"] = min(99, round(sum(confidences) / len(confidences)) + 5)
+        else:
+            # Passes disagree — keep the higher-confidence answer but
+            # discount it, and surface the alternate so the farmer (and
+            # any human reviewer reading the log) can see the model wasn't
+            # actually sure, instead of a falsely-confident single answer.
+            primary["confidence"] = max(30, round(primary.get("confidence", 50) * 0.7))
+            disagreeing = next((o for o, f in zip(others, agree_flags) if not f), None)
+            if disagreeing:
+                alternate_diagnosis = disagreeing.get("disease")
+
+    primary["_lang"] = lang
+    primary["model_agreement"] = agreement
+    primary["_passes_run"] = len(results)
+    if alternate_diagnosis:
+        primary["alternate_diagnosis"] = alternate_diagnosis
+
+    # ── Step 4: log image + full result for human spot-checking ─────────
+    record_id = f"{int(time.time()*1000)}_{ip.replace('.', '-').replace(':', '-')}"
+    image_filename = _save_diagnosis_image(image_b64, record_id)
+    _log_diagnosis({
+        "id":                   record_id,
+        "timestamp":            datetime.now().isoformat(),
+        "ip":                   ip,
+        "lang":                 lang,
+        "models_used":          models_used,
+        "passes_run":           len(results),
+        "model_agreement":      agreement,
+        "final_disease":        primary.get("disease"),
+        "final_confidence":     primary.get("confidence"),
+        "alternate_diagnosis":  alternate_diagnosis,
+        "severity":             primary.get("severity"),
+        "image_file":           image_filename,
+        "raw_results":          results,   # every pass' full untouched output
+        "human_reviewed":       False,     # a reviewer can flip this after checking the image
+        "human_verdict":        None,      # "correct" | "incorrect" | "uncertain"
+    })
+
+    return jsonify(primary)
+
+
+# ─── Diagnosis QA review endpoints (internal, DEBUG_MODE only) ──────────────
+@app.route('/api/diagnose-log')
+def diagnose_log():
+    """Lets a human reviewer list recent diagnoses to spot-check the AI
+    against the real uploaded photo. This is intentionally an internal QA
+    tool, not a farmer-facing feature — it exposes raw model output and
+    request IPs, so it's gated behind FLASK_DEBUG=1."""
+    if not DEBUG_MODE:
+        return jsonify({"error": "Not available in production. Set FLASK_DEBUG=1 in .env"}), 403
+    limit = min(int(request.args.get('limit', 50)), 500)
+    entries = []
+    try:
+        with open(DIAGNOSIS_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        for line in reversed(lines):
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except FileNotFoundError:
+        pass
+    return jsonify({"count": len(entries), "entries": entries})
+
+
+@app.route('/api/diagnose-log/image/<path:filename>')
+def diagnose_log_image(filename):
+    if not DEBUG_MODE:
+        return jsonify({"error": "Not available in production. Set FLASK_DEBUG=1 in .env"}), 403
+    safe_name = os.path.basename(filename)  # prevent path traversal
+    path = os.path.join(DIAGNOSIS_IMAGES_DIR, safe_name)
+    if not os.path.isfile(path):
+        return jsonify({"error": "Not found"}), 404
+    from flask import send_file
+    return send_file(path, mimetype="image/jpeg")
+
+
+@app.route('/api/diagnose-log/review', methods=["POST"])
+def diagnose_log_review():
+    """Lets a reviewer record a verdict ("correct"/"incorrect"/"uncertain")
+    against a logged diagnosis by rewriting its line in the JSONL file.
+    This closes the loop: stored images + reviewer verdicts are exactly
+    the labeled data needed to eventually compute a real accuracy number
+    instead of relying on the model's own self-reported confidence."""
+    if not DEBUG_MODE:
+        return jsonify({"error": "Not available in production. Set FLASK_DEBUG=1 in .env"}), 403
+    data = request.json or {}
+    record_id = data.get("id")
+    verdict = data.get("verdict")
+    if not record_id or verdict not in ("correct", "incorrect", "uncertain"):
+        return jsonify({"error": "Provide id and verdict (correct|incorrect|uncertain)"}), 400
+
+    try:
+        with _diagnosis_log_lock:
+            with open(DIAGNOSIS_LOG_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            updated = False
+            for i, line in enumerate(lines):
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("id") == record_id:
+                    rec["human_reviewed"] = True
+                    rec["human_verdict"] = verdict
+                    lines[i] = json.dumps(rec, ensure_ascii=False) + "\n"
+                    updated = True
+                    break
+            if updated:
+                with open(DIAGNOSIS_LOG_PATH, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+        return jsonify({"status": "ok" if updated else "not_found"}), (200 if updated else 404)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/diagnose-log/accuracy')
+def diagnose_log_accuracy():
+    """Computes real accuracy from whatever human verdicts have been
+    recorded so far. Returns 0 reviewed entries until someone actually
+    uses /api/diagnose-log/review — which is the honest state until real
+    review happens, rather than a fabricated number."""
+    if not DEBUG_MODE:
+        return jsonify({"error": "Not available in production. Set FLASK_DEBUG=1 in .env"}), 403
+    total = reviewed = correct = 0
+    agreement_correct = agreement_total = 0
+    try:
+        with open(DIAGNOSIS_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                total += 1
+                if rec.get("human_reviewed"):
+                    reviewed += 1
+                    is_correct = rec.get("human_verdict") == "correct"
+                    if is_correct:
+                        correct += 1
+                    if rec.get("model_agreement"):
+                        agreement_total += 1
+                        if is_correct:
+                            agreement_correct += 1
+    except FileNotFoundError:
+        pass
+
+    return jsonify({
+        "total_logged":            total,
+        "human_reviewed":          reviewed,
+        "accuracy_reviewed_only":  round(correct / reviewed, 3) if reviewed else None,
+        "agreement_case_accuracy": round(agreement_correct / agreement_total, 3) if agreement_total else None,
+        "note": "accuracy_reviewed_only is ONLY meaningful once a human has reviewed "
+                "a reasonably-sized, representative sample via /api/diagnose-log/review. "
+                "agreement_case_accuracy shows whether the model_agreement flag actually "
+                "predicts correctness — the thing to check before trusting it as a signal.",
+    })
 
 
 # ─── Alerts ──────────────────────────────────────────────────────────────────
@@ -1470,6 +1791,16 @@ def translate_diagnose():
         "Our AI model analyzes visual patterns to identify diseases with high accuracy",
         "Get Remedies",
         "Receive eco-friendly and chemical treatment plans with dosage details instantly",
+        # Pre-classifier rejection state
+        "Not a Crop Photo",
+        "We couldn't detect a plant, leaf, stem, fruit, or root in this image.",
+        "Please retake the photo focused closely on the affected crop part.",
+        "Retake Photo",
+        "That doesn't look like a crop photo — please retake it focused on the plant.",
+        # Ensemble agreement badges
+        "Cross-Checked", "Low Agreement", "Alternate possibility",
+        "Confirmed by multiple independent AI analysis passes",
+        "Two independent AI passes disagreed, so confidence was lowered.",
     ]
 
     domain_note = "This is UI copy and section labels for a crop-disease-diagnosis app. Keep tone simple and clear for farmers; keep numbers/units/file types (JPG, PNG, WEBP, MB, cm) unchanged."

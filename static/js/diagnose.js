@@ -462,10 +462,29 @@ async function analyzeImage() {
             headers: { 'Content-Type': 'application/json' },
             body:    JSON.stringify({ image: currentImageBase64, hints, lang: getLang() })
         });
+        const data = await res.json().catch(() => ({}));
 
-        if (!res.ok) throw new Error(`Server responded ${res.status}`);
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
+        // ── Pre-classifier rejected the photo as "not a plant" ──
+        // Handled separately from generic failures: this isn't a server
+        // error, it's the app correctly declining to guess at a disease
+        // for a photo that isn't a crop in the first place.
+        if (!res.ok && data.error === 'not_a_plant') {
+            showToast('🌱 ' + tr('That doesn\'t look like a crop photo — please retake it focused on the plant.'), 'warning');
+            if (panel) panel.innerHTML = `
+              <div class="results-placeholder">
+                <div class="placeholder-icon" style="opacity:1;color:var(--amber)">
+                  <i class="fas fa-seedling"></i>
+                </div>
+                <h3 style="color:var(--amber)">${tr('Not a Crop Photo')}</h3>
+                <p>${tr("We couldn't detect a plant, leaf, stem, fruit, or root in this image.")}<br>${tr('Please retake the photo focused closely on the affected crop part.')}</p>
+                <button class="btn-secondary" style="margin-top:16px" onclick="clearImage()">
+                  <i class="fas fa-camera"></i> ${tr('Retake Photo')}
+                </button>
+              </div>`;
+            return;
+        }
+
+        if (!res.ok || data.error) throw new Error(data.error || `Server responded ${res.status}`);
 
         // Store raw English result for re-translation on language switch
         _lastDiagnosisResult = data;
@@ -572,6 +591,29 @@ async function renderDiagnosisResults(data) {
     const sevClass  = `badge-severity-${(data.severity || 'mild').toLowerCase()}`;
     const isHealthy = (data.disease || '').toLowerCase().includes('healthy');
 
+    // ── Cross-check badge ────────────────────────────────────────────
+    // Reflects the backend's multi-pass ensemble/self-consistency vote:
+    // agreement across independent passes is shown as reassurance,
+    // disagreement is surfaced (with the alternate guess) rather than
+    // hidden behind a falsely-confident single number.
+    let agreementBadge = '';
+    if (data.model_agreement === false) {
+        const altName = tField(data.alternate_diagnosis) || data.alternate_diagnosis || '';
+        const tip = tr('Two independent AI passes disagreed, so confidence was lowered.') +
+            (altName ? ' ' + tr('Alternate possibility') + ': ' + altName : '');
+        agreementBadge = `
+          <span class="result-badge" title="${tip.replace(/"/g, '&quot;')}"
+                style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);color:var(--amber)">
+            <i class="fas fa-triangle-exclamation"></i> ${tr('Low Agreement')}
+          </span>`;
+    } else if ((data._passes_run || 1) > 1) {
+        agreementBadge = `
+          <span class="result-badge" title="${tr('Confirmed by multiple independent AI analysis passes').replace(/"/g, '&quot;')}"
+                style="background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.22);color:var(--green)">
+            <i class="fas fa-check-double"></i> ${tr('Cross-Checked')}
+          </span>`;
+    }
+
     panel.innerHTML = `
     <div class="results-content">
 
@@ -589,6 +631,7 @@ async function renderDiagnosisResults(data) {
           <span class="result-badge" style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);color:var(--amber)">
             <i class="fas fa-leaf"></i> ${affectedPart}
           </span>` : ''}
+          ${agreementBadge}
         </div>
       </div>
 
