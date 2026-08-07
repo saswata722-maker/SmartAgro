@@ -45,6 +45,19 @@ window.weatherData = null;
 /* ── Geolocation helper ─────────────────────── */
 function requestLocation(callback) {
     const btn = document.getElementById('locationBtn') || document.getElementById('alertLocationBtn');
+    
+    // Check session storage first
+    const savedLat = sessionStorage.getItem('userLat');
+    const savedLon = sessionStorage.getItem('userLon');
+    if (savedLat && savedLon) {
+        if (btn) {
+            btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
+            btn.style.background = 'linear-gradient(135deg, #166534, #22c55e)';
+        }
+        if (typeof callback === 'function') callback(parseFloat(savedLat), parseFloat(savedLon));
+        return;
+    }
+
     if (btn) {
         btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>Getting location...</span>`;
         btn.disabled = true;
@@ -62,6 +75,8 @@ function requestLocation(callback) {
     navigator.geolocation.getCurrentPosition(
         position => {
             const { latitude, longitude } = position.coords;
+            sessionStorage.setItem('userLat', latitude);
+            sessionStorage.setItem('userLon', longitude);
             if (btn) {
                 btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
                 btn.style.background = 'linear-gradient(135deg, #166534, #22c55e)';
@@ -78,11 +93,10 @@ function requestLocation(callback) {
             }
             // Fallback: use Delhi, India as default
             if (typeof callback === 'function') callback(28.6139, 77.2090);
-            // To this:
         }, {
-            timeout: 15000, // Gives the browser 15 seconds to find a position
-            enableHighAccuracy: false, // Desktop browsers fail high accuracy if they lack a GPS chip
-            maximumAge: 60000 // Allows utilizing a recently cached location asset
+            timeout: 15000, 
+            enableHighAccuracy: false, 
+            maximumAge: 60000 
         }
     );
 }

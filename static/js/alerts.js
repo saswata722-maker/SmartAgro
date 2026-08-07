@@ -166,6 +166,15 @@ document.addEventListener('langChanged', (e) => {
 /* ── Entry point: request location ─────────── */
 function requestAlertsLocation() {
     const btn = document.getElementById('alertLocationBtn');
+
+    // Check session storage first
+    const savedLat = sessionStorage.getItem('userLat');
+    const savedLon = sessionStorage.getItem('userLon');
+    if (savedLat && savedLon) {
+        loadAlertsData(parseFloat(savedLat), parseFloat(savedLon));
+        return;
+    }
+
     if (btn) {
         btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>Getting location...</span>`;
         btn.disabled = true;
@@ -179,6 +188,8 @@ function requestAlertsLocation() {
 
     navigator.geolocation.getCurrentPosition(
         pos => {
+            sessionStorage.setItem('userLat', pos.coords.latitude);
+            sessionStorage.setItem('userLon', pos.coords.longitude);
             showToast('📍 Location detected!', 'success');
             loadAlertsData(pos.coords.latitude, pos.coords.longitude);
         },
@@ -606,10 +617,14 @@ const ALL_CROPS_DATA = [
     { name: 'Sugarcane', icon: '🎋', minTemp: 24, maxTemp: 38, minHumidity: 75, waterNeed: 'Very High' },
     { name: 'Soybean', icon: '🫘', minTemp: 20, maxTemp: 32, minHumidity: 60, waterNeed: 'Medium' },
     { name: 'Mustard', icon: '🌻', minTemp: 10, maxTemp: 25, minHumidity: 40, waterNeed: 'Low' },
-    { name: 'Potato', icon: '🥔', minTemp: 10, maxTemp: 22, minHumidity: 60, waterNeed: 'Medium' },
-    { name: 'Onion', icon: '🧅', minTemp: 13, maxTemp: 28, minHumidity: 50, waterNeed: 'Medium' },
-    { name: 'Chilli', icon: '🌶️', minTemp: 20, maxTemp: 35, minHumidity: 60, waterNeed: 'Medium' },
-    { name: 'Groundnut', icon: '🥜', minTemp: 22, maxTemp: 36, minHumidity: 50, waterNeed: 'Medium' },
+    { name: 'Chickpea (Gram)', icon: '🌱', minTemp: 15, maxTemp: 28, minHumidity: 35, waterNeed: 'Low' },
+    { name: 'Groundnut', icon: '🥜', minTemp: 22, maxTemp: 35, minHumidity: 45, waterNeed: 'Medium' },
+    { name: 'Potato', icon: '🥔', minTemp: 12, maxTemp: 24, minHumidity: 60, waterNeed: 'Medium' },
+    { name: 'Onion', icon: '🧅', minTemp: 15, maxTemp: 30, minHumidity: 50, waterNeed: 'Medium' },
+    { name: 'Pearl Millet (Bajra)', icon: '🌾', minTemp: 25, maxTemp: 40, minHumidity: 30, waterNeed: 'Low' },
+    { name: 'Sorghum (Jowar)', icon: '🌽', minTemp: 26, maxTemp: 38, minHumidity: 40, waterNeed: 'Low' },
+    { name: 'Chili', icon: '🌶️', minTemp: 20, maxTemp: 35, minHumidity: 50, waterNeed: 'Medium' },
+    { name: 'Turmeric', icon: '🫚', minTemp: 20, maxTemp: 35, minHumidity: 65, waterNeed: 'High' },
 ];
 
 function renderHarmfulSafeCrops(weather) {

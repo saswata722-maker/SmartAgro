@@ -174,8 +174,7 @@ CROP_AI_CACHE_TTL_SEC = 3 * 60 * 60  # 3 hours — same city/season/weather buck
 def ai_recommend_crops(city, lat, lon, temp, humidity, rain, season):
     """Ask Groq for crops genuinely suited to THIS location's climate, soil
     region and season — instead of matching generic temp/humidity bands
-    against a fixed 8-crop table (which produced near-identical results for
-    any two places with similar weather, regardless of state/soil/region).
+    against a fixed table.
     Returns None on any failure so the caller can fall back to the
     rule-based recommend_crops() and the dashboard never breaks."""
     if not GROQ_API_KEY:
@@ -224,7 +223,7 @@ exactly this shape:
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     body = {
-        "model":       "openai/gpt-oss-120b",
+        "model":       "llama-3.3-70b-versatile",
         "messages":    [{"role": "user", "content": prompt}],
         "temperature": 0.4,
         "max_tokens":  1500,
@@ -290,71 +289,144 @@ def get_season(month):
 
 def recommend_crops(temp, humidity, rain, season):
     all_crops = [
-        {"name":"Rice","icon":"🌾","temp_range":(20,38),"humidity_range":(70,100),"season":"Kharif (Monsoon)","water":"High","yield":"3-5 tonnes/ha","profit":"Rs45,000-65,000/ha","duration":"90-150 days","description":"Ideal for high humidity and warm conditions","soil":"Clay loam, alluvial","fertilizer":"NPK 120:60:60 kg/ha"},
-        {"name":"Wheat","icon":"🌿","temp_range":(10,25),"humidity_range":(40,65),"season":"Rabi (Winter)","water":"Medium","yield":"4-6 tonnes/ha","profit":"Rs50,000-75,000/ha","duration":"100-150 days","description":"Best suited for cool, dry winters","soil":"Well-drained loam","fertilizer":"NPK 120:60:40 kg/ha"},
-        {"name":"Maize","icon":"🌽","temp_range":(18,35),"humidity_range":(50,80),"season":"Kharif (Monsoon)","water":"Medium","yield":"5-8 tonnes/ha","profit":"Rs40,000-60,000/ha","duration":"80-110 days","description":"Versatile crop for warm humid weather","soil":"Sandy loam to clay loam","fertilizer":"NPK 150:75:75 kg/ha"},
-        {"name":"Cotton","icon":"☁️","temp_range":(25,40),"humidity_range":(40,70),"season":"Kharif (Monsoon)","water":"Medium","yield":"2-3 tonnes/ha","profit":"Rs60,000-90,000/ha","duration":"150-180 days","description":"Thrives in hot dry spells with moderate rain","soil":"Black cotton soil","fertilizer":"NPK 90:45:45 kg/ha"},
-        {"name":"Tomato","icon":"🍅","temp_range":(18,30),"humidity_range":(60,80),"season":"Zaid (Summer)","water":"Medium","yield":"20-40 tonnes/ha","profit":"Rs80,000-1,50,000/ha","duration":"60-80 days","description":"High value crop for moderate climates","soil":"Sandy loam, rich organic matter","fertilizer":"NPK 100:60:60 kg/ha"},
-        {"name":"Sugarcane","icon":"🎋","temp_range":(24,38),"humidity_range":(75,90),"season":"Kharif (Monsoon)","water":"Very High","yield":"70-100 tonnes/ha","profit":"Rs70,000-1,00,000/ha","duration":"300-360 days","description":"Requires hot climate and heavy rainfall","soil":"Deep loam, good drainage","fertilizer":"NPK 250:80:100 kg/ha"},
-        {"name":"Soybean","icon":"🫘","temp_range":(20,32),"humidity_range":(60,80),"season":"Kharif (Monsoon)","water":"Medium","yield":"2-3 tonnes/ha","profit":"Rs35,000-55,000/ha","duration":"90-120 days","description":"Nitrogen-fixing legume for warm monsoon","soil":"Well-drained loam","fertilizer":"NPK 30:60:40 kg/ha"},
-        {"name":"Mustard","icon":"🌻","temp_range":(10,25),"humidity_range":(40,60),"season":"Rabi (Winter)","water":"Low","yield":"1-2 tonnes/ha","profit":"Rs25,000-40,000/ha","duration":"90-110 days","description":"Cool weather oil seed crop","soil":"Sandy loam, well-drained","fertilizer":"NPK 80:40:40 kg/ha"},
+        {"name":"Rice","icon":"🌾","temp_range":(20,38),"humidity_range":(70,100),"rain_min":15,"season":"Kharif (Monsoon)","water":"High","yield":"3-5 tonnes/ha","profit":"Rs45,000-65,000/ha","duration":"90-150 days","description":"Ideal for high humidity and warm monsoon conditions","soil":"Clay loam, alluvial","fertilizer":"NPK 120:60:60 kg/ha"},
+        {"name":"Wheat","icon":"🌿","temp_range":(10,25),"humidity_range":(40,65),"rain_min":0,"season":"Rabi (Winter)","water":"Medium","yield":"4-6 tonnes/ha","profit":"Rs50,000-75,000/ha","duration":"100-150 days","description":"Best suited for cool, dry winters","soil":"Well-drained loam","fertilizer":"NPK 120:60:40 kg/ha"},
+        {"name":"Maize","icon":"🌽","temp_range":(18,35),"humidity_range":(50,80),"rain_min":5,"season":"Kharif (Monsoon)","water":"Medium","yield":"5-8 tonnes/ha","profit":"Rs40,000-60,000/ha","duration":"80-110 days","description":"Versatile crop for warm humid weather","soil":"Sandy loam to clay loam","fertilizer":"NPK 150:75:75 kg/ha"},
+        {"name":"Cotton","icon":"☁️","temp_range":(25,40),"humidity_range":(40,70),"rain_min":0,"season":"Kharif (Monsoon)","water":"Medium","yield":"2-3 tonnes/ha","profit":"Rs60,000-90,000/ha","duration":"150-180 days","description":"Thrives in hot dry spells with moderate rain","soil":"Black cotton soil","fertilizer":"NPK 90:45:45 kg/ha"},
+        {"name":"Tomato","icon":"🍅","temp_range":(18,30),"humidity_range":(60,80),"rain_min":0,"season":"Zaid (Summer)","water":"Medium","yield":"20-40 tonnes/ha","profit":"Rs80,000-1,50,000/ha","duration":"60-80 days","description":"High value crop for moderate climates","soil":"Sandy loam, rich organic matter","fertilizer":"NPK 100:60:60 kg/ha"},
+        {"name":"Sugarcane","icon":"🎋","temp_range":(24,38),"humidity_range":(75,90),"rain_min":20,"season":"Kharif (Monsoon)","water":"Very High","yield":"70-100 tonnes/ha","profit":"Rs70,000-1,00,000/ha","duration":"300-360 days","description":"Requires hot climate and heavy rainfall/irrigation","soil":"Deep loam, good drainage","fertilizer":"NPK 250:80:100 kg/ha"},
+        {"name":"Soybean","icon":"🫘","temp_range":(20,32),"humidity_range":(60,80),"rain_min":10,"season":"Kharif (Monsoon)","water":"Medium","yield":"2-3 tonnes/ha","profit":"Rs35,000-55,000/ha","duration":"90-120 days","description":"Nitrogen-fixing legume for warm monsoon","soil":"Well-drained loam","fertilizer":"NPK 30:60:40 kg/ha"},
+        {"name":"Mustard","icon":"🌻","temp_range":(10,25),"humidity_range":(40,60),"rain_min":0,"season":"Rabi (Winter)","water":"Low","yield":"1-2 tonnes/ha","profit":"Rs25,000-40,000/ha","duration":"90-110 days","description":"Cool weather oil seed crop","soil":"Sandy loam, well-drained","fertilizer":"NPK 80:40:40 kg/ha"},
+        {"name":"Chickpea (Gram)","icon":"🌱","temp_range":(15,28),"humidity_range":(35,65),"rain_min":0,"season":"Rabi (Winter)","water":"Low","yield":"1.5-2.5 tonnes/ha","profit":"Rs35,000-50,000/ha","duration":"90-120 days","description":"Drought-tolerant pulse crop ideal for Rabi season","soil":"Deep sandy loam to clay loam","fertilizer":"NPK 20:50:20 kg/ha"},
+        {"name":"Groundnut","icon":"🥜","temp_range":(22,35),"humidity_range":(45,75),"rain_min":5,"season":"Kharif (Monsoon)","water":"Medium","yield":"2-3.5 tonnes/ha","profit":"Rs45,000-70,000/ha","duration":"100-130 days","description":"Excellent oilseed crop for sandy loam soils","soil":"Well-drained light sandy loam","fertilizer":"NPK 25:50:40 kg/ha"},
+        {"name":"Potato","icon":"🥔","temp_range":(12,24),"humidity_range":(60,80),"rain_min":0,"season":"Rabi (Winter)","water":"Medium","yield":"25-35 tonnes/ha","profit":"Rs90,000-1,60,000/ha","duration":"80-110 days","description":"High-yielding tuber crop for cool winters","soil":"Deep, friable sandy loam","fertilizer":"NPK 180:80:100 kg/ha"},
+        {"name":"Onion","icon":"🧅","temp_range":(15,30),"humidity_range":(50,75),"rain_min":0,"season":"Rabi (Winter)","water":"Medium","yield":"15-25 tonnes/ha","profit":"Rs80,000-1,40,000/ha","duration":"110-140 days","description":"Essential bulb crop with strong market demand","soil":"Deep alluvial or red loams","fertilizer":"NPK 100:50:50 kg/ha"},
+        {"name":"Pearl Millet (Bajra)","icon":"🌾","temp_range":(25,40),"humidity_range":(30,65),"rain_min":0,"season":"Kharif (Monsoon)","water":"Low","yield":"2-4 tonnes/ha","profit":"Rs25,000-45,000/ha","duration":"75-90 days","description":"Extremely hardy millet for dry climates","soil":"Light sandy soil","fertilizer":"NPK 80:40:40 kg/ha"},
+        {"name":"Sorghum (Jowar)","icon":"🌽","temp_range":(26,38),"humidity_range":(40,70),"rain_min":0,"season":"Kharif (Monsoon)","water":"Low","yield":"2.5-4.5 tonnes/ha","profit":"Rs30,000-50,000/ha","duration":"100-120 days","description":"Drought-resistant grain crop for arid regions","soil":"Deep black loamy soil","fertilizer":"NPK 80:40:40 kg/ha"},
+        {"name":"Chili","icon":"🌶️","temp_range":(20,35),"humidity_range":(50,80),"rain_min":0,"season":"Zaid (Summer)","water":"Medium","yield":"2-4 tonnes/ha","profit":"Rs1,00,000-2,00,000/ha","duration":"120-150 days","description":"High-return spice crop for warm seasons","soil":"Rich well-drained loamy soil","fertilizer":"NPK 120:60:60 kg/ha"},
+        {"name":"Turmeric","icon":"🫚","temp_range":(20,35),"humidity_range":(65,90),"rain_min":15,"season":"Kharif (Monsoon)","water":"High","yield":"20-30 tonnes/ha","profit":"Rs1,20,000-2,20,000/ha","duration":"240-270 days","description":"Long-duration high value spice crop","soil":"Well-drained loamy or alluvial soil","fertilizer":"NPK 60:50:120 kg/ha"},
     ]
     scored = []
     for crop in all_crops:
         score = 0
-        if crop["temp_range"][0] <= temp <= crop["temp_range"][1]:
-            score += 40
-        elif abs(temp - sum(crop["temp_range"]) / 2) < 5:
-            score += 20
-        if crop["humidity_range"][0] <= humidity <= crop["humidity_range"][1]:
-            score += 30
+        # 1. Temperature score (max 35)
+        min_t, max_t = crop["temp_range"]
+        if min_t <= temp <= max_t:
+            score += 35
+        else:
+            dist = min(abs(temp - min_t), abs(temp - max_t))
+            score += max(0, int(35 - dist * 4))
+
+        # 2. Humidity score (max 25)
+        min_h, max_h = crop["humidity_range"]
+        if min_h <= humidity <= max_h:
+            score += 25
+        else:
+            dist = min(abs(humidity - min_h), abs(humidity - max_h))
+            score += max(0, int(25 - dist * 1.5))
+
+        # 3. Rainfall / Water score (max 20)
+        water_req = crop.get("water", "Medium")
+        if water_req == "Low":
+            score += 20 if rain < 15 else 14
+        elif water_req == "Medium":
+            score += 20 if 5 <= rain <= 40 else 15
+        elif water_req in ("High", "Very High"):
+            score += 20 if rain >= crop.get("rain_min", 15) else 10
+
+        # 4. Season match score (max 20)
         if crop["season"] == season:
-            score += 30
-        crop["score"] = score
-        crop["match"] = f"{min(100, score)}%"
+            score += 20
+        elif "Kharif" in crop["season"] and season == "Kharif (Monsoon)":
+            score += 20
+        elif "Rabi" in crop["season"] and season == "Rabi (Winter)":
+            score += 20
+        else:
+            score += 5
+
+        crop["score"] = min(98, score)
+        crop["match"] = f"{crop['score']}%"
         scored.append(crop)
+
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
 
 
 def generate_advisory_calendar(crops):
     today = datetime.now()
-    activities = [
-        {"week":1,  "activity":"Soil preparation & ploughing",  "type":"preparation"},
-        {"week":2,  "activity":"Seed treatment & sowing",       "type":"sowing"},
-        {"week":3,  "activity":"First irrigation",              "type":"irrigation"},
-        {"week":4,  "activity":"Apply basal fertilizer (NPK)",  "type":"fertilizer"},
-        {"week":6,  "activity":"Weeding & thinning",            "type":"maintenance"},
-        {"week":8,  "activity":"Apply Urea (top dressing)",     "type":"fertilizer"},
-        {"week":10, "activity":"Pest & disease inspection",     "type":"pesticide"},
-        {"week":12, "activity":"Spray fungicide if required",   "type":"pesticide"},
-        {"week":16, "activity":"Foliar spray micronutrients",   "type":"fertilizer"},
-        {"week":20, "activity":"Pre-harvest irrigation stop",   "type":"irrigation"},
-        {"week":22, "activity":"Harvest preparation",           "type":"harvest"},
+    # Determine primary crop's duration range (default ~120 days = 17 weeks)
+    primary_crop = crops[0] if crops else {}
+    dur_str = primary_crop.get("duration", "90-120 days")
+    match_dur = re.findall(r"\d+", dur_str)
+    if match_dur:
+        avg_days = sum(int(x) for x in match_dur) / len(match_dur)
+    else:
+        avg_days = 110
+    total_weeks = max(8, min(48, int(avg_days / 7)))
+
+    # Scale stages relative to total crop duration
+    w_prep   = max(1, int(total_weeks * 0.05))
+    w_sow    = max(2, int(total_weeks * 0.10))
+    w_irr1   = max(3, int(total_weeks * 0.15))
+    w_fert1  = max(4, int(total_weeks * 0.22))
+    w_weed   = max(5, int(total_weeks * 0.32))
+    w_topd   = max(7, int(total_weeks * 0.45))
+    w_pest   = max(9, int(total_weeks * 0.58))
+    w_fung   = max(11, int(total_weeks * 0.70))
+    w_foliar = max(13, int(total_weeks * 0.82))
+    w_stopi  = max(14, int(total_weeks * 0.90))
+    w_harv   = total_weeks
+
+    stages = [
+        (w_prep,   "Soil preparation & deep ploughing", "preparation"),
+        (w_sow,    f"Seed treatment & sowing for {primary_crop.get('name', 'crop')}", "sowing"),
+        (w_irr1,   "First post-sowing irrigation", "irrigation"),
+        (w_fert1,  f"Apply basal fertilizer ({primary_crop.get('fertilizer', 'NPK')})", "fertilizer"),
+        (w_weed,   "First weeding & crop thinning", "maintenance"),
+        (w_topd,   "Apply Nitrogen top dressing (Urea)", "fertilizer"),
+        (w_pest,   "Inspect fields for early pest/disease infestation", "pesticide"),
+        (w_fung,   "Apply preventive fungicide spray if humid", "pesticide"),
+        (w_foliar, "Foliar spray of micronutrients & booster", "fertilizer"),
+        (w_stopi,  "Stop irrigation 10-14 days before harvesting", "irrigation"),
+        (w_harv,   "Harvesting & threshing at full maturity", "harvest"),
     ]
+
     calendar = []
-    for act in activities:
-        date = today + timedelta(weeks=act["week"])
+    for week_num, act, act_type in stages:
+        date = today + timedelta(weeks=week_num)
         calendar.append({
             "date":     date.strftime("%d %b %Y"),
-            "activity": act["activity"],
-            "type":     act["type"],
-            "week":     act["week"]
+            "activity": act,
+            "type":     act_type,
+            "week":     week_num
         })
     return calendar
 
 
 def get_pesticide_guide(crops):
     guides = {
-        "Rice":   [{"pest":"Brown Plant Hopper","pesticide":"Imidacloprid 17.8 SL","dose":"125 ml/ha","timing":"At 30 & 60 days after transplanting","eco":False},{"pest":"Leaf folder","pesticide":"Neem Oil 5%","dose":"2.5 L/ha","timing":"At first sign of damage","eco":True}],
-        "Wheat":  [{"pest":"Aphids","pesticide":"Dimethoate 30 EC","dose":"1 L/ha","timing":"At tillering stage","eco":False},{"pest":"Yellow rust","pesticide":"Propiconazole 25 EC","dose":"500 ml/ha","timing":"At boot leaf stage","eco":False}],
-        "Maize":  [{"pest":"Fall Armyworm","pesticide":"Spinetoram 11.7 SC","dose":"450 ml/ha","timing":"7-10 days after infestation","eco":False},{"pest":"Stem borer","pesticide":"Emamectin Benzoate 5 SG","dose":"220 g/ha","timing":"At whorl stage","eco":False}],
-        "Cotton": [{"pest":"Bollworm","pesticide":"Chlorpyriphos 20 EC","dose":"2.5 ml/L","timing":"At first boll formation","eco":False},{"pest":"Whitefly","pesticide":"Neem Oil 5%","dose":"5 ml/L","timing":"Every 7 days","eco":True}],
+        "Rice":                 [{"pest":"Brown Plant Hopper","pesticide":"Imidacloprid 17.8 SL","dose":"125 ml/ha","timing":"At 30 & 60 days after transplanting","eco":False},{"pest":"Leaf folder","pesticide":"Neem Oil 5%","dose":"2.5 L/ha","timing":"At first sign of damage","eco":True}],
+        "Wheat":                [{"pest":"Aphids","pesticide":"Dimethoate 30 EC","dose":"1 L/ha","timing":"At tillering stage","eco":False},{"pest":"Yellow rust","pesticide":"Propiconazole 25 EC","dose":"500 ml/ha","timing":"At boot leaf stage","eco":False}],
+        "Maize":                [{"pest":"Fall Armyworm","pesticide":"Spinetoram 11.7 SC","dose":"450 ml/ha","timing":"7-10 days after infestation","eco":False},{"pest":"Stem borer","pesticide":"Emamectin Benzoate 5 SG","dose":"220 g/ha","timing":"At whorl stage","eco":False}],
+        "Cotton":               [{"pest":"Bollworm","pesticide":"Chlorpyriphos 20 EC","dose":"2.5 ml/L","timing":"At first boll formation","eco":False},{"pest":"Whitefly","pesticide":"Neem Oil 5%","dose":"5 ml/L","timing":"Every 7 days","eco":True}],
+        "Tomato":               [{"pest":"Fruit Borer","pesticide":"Flubendiamide 480 SC","dose":"200 ml/ha","timing":"At flowering/fruiting","eco":False},{"pest":"Early Blight","pesticide":"Trichoderma viride 1%","dose":"5 g/L","timing":"Foliar spray at 15-day intervals","eco":True}],
+        "Sugarcane":            [{"pest":"Early Shoot Borer","pesticide":"Chlorantraniliprole 18.5 SC","dose":"375 ml/ha","timing":"At 30-45 days after planting","eco":False},{"pest":"Whitefly","pesticide":"Neem cake application","dose":"250 kg/ha","timing":"During soil preparation","eco":True}],
+        "Soybean":              [{"pest":"Girdle Beetle","pesticide":"Thiamethoxam 25 WG","dose":"100 g/ha","timing":"At first detection","eco":False},{"pest":"Tobacco Caterpillar","pesticide":"SLNPV Bio-pesticide","dose":"250 LE/ha","timing":"Evening spray on young larvae","eco":True}],
+        "Mustard":              [{"pest":"Mustard Aphid","pesticide":"Dimethoate 30 EC","dose":"650 ml/ha","timing":"When 20-30 aphids/plant seen","eco":False},{"pest":"White Rust","pesticide":"Mancozeb 75 WP","dose":"1.5 kg/ha","timing":"Preventive spray at 45 days","eco":False}],
+        "Chickpea (Gram)":      [{"pest":"Pod Borer (Helicoverpa)","pesticide":"HaNPV 250 LE/ha","dose":"250 LE/ha","timing":"At flowering stage","eco":True},{"pest":"Wilt","pesticide":"Seed treatment with Trichoderma","dose":"10 g/kg seed","timing":"Before sowing","eco":True}],
+        "Groundnut":            [{"pest":"Tikka Leaf Spot","pesticide":"Carbendazim 50 WP","dose":"500 g/ha","timing":"At first symptom appearance","eco":False},{"pest":"White Grub","pesticide":"Beauveria bassiana","dose":"5 kg/ha","timing":"Soil application at sowing","eco":True}],
+        "Potato":               [{"pest":"Late Blight","pesticide":"Mancozeb + Metalaxyl","dose":"2.5 g/L","timing":"Prophylactic spray before rains","eco":False},{"pest":"Aphids","pesticide":"Neem oil 10,000 ppm","dose":"2 ml/L","timing":"Weekly spray","eco":True}],
+        "Onion":                [{"pest":"Thrips","pesticide":"Fipronil 5 SC","dose":"1.5 ml/L","timing":"When 10 thrips/plant observed","eco":False},{"pest":"Purple Blotch","pesticide":"Copper Oxychloride 50 WP","dose":"3 g/L","timing":"Spray at 15-day intervals","eco":False}],
+        "Pearl Millet (Bajra)": [{"pest":"Downy Mildew","pesticide":"Metalaxyl 35 SD","dose":"6 g/kg seed","timing":"Seed treatment before sowing","eco":False},{"pest":"Shoot Fly","pesticide":"Neem seed kernel extract 5%","dose":"500 L/ha","timing":"At 7 and 14 days after emergence","eco":True}],
+        "Sorghum (Jowar)":      [{"pest":"Shoot Fly","pesticide":"Imidacloprid 70 WS","dose":"10 g/kg seed","timing":"Seed dressing","eco":False},{"pest":"Stem Borer","pesticide":"Carbofuran 3G granules","dose":"8 kg/ha","timing":"In leaf whorls at 20 days","eco":False}],
+        "Chili":                [{"pest":"Chili Thrips & Mites","pesticide":"Spinosad 45 SC","dose":"160 ml/ha","timing":"At peak vector activity","eco":False},{"pest":"Damping Off","pesticide":"Trichoderma harzianum","dose":"10 g/kg seed","timing":"Nursery bed treatment","eco":True}],
+        "Turmeric":             [{"pest":"Rhizome Rot","pesticide":"Pseudomonas fluorescens","dose":"10 g/L","timing":"Rhizome dipping before planting","eco":True},{"pest":"Leaf Spot","pesticide":"Mancozeb 75 WP","dose":"2.5 g/L","timing":"Spray at 30-day intervals","eco":False}],
     }
     result = []
     for crop in crops:
-        if crop["name"] in guides:
-            result.append({"crop": crop["name"], "guides": guides[crop["name"]]})
+        cname = crop.get("name", "")
+        if cname in guides:
+            result.append({"crop": cname, "guides": guides[cname]})
     return result
 
 
@@ -773,17 +845,38 @@ def kisan_chat():
         return jsonify({"error": "No messages"}), 400
 
     lang_name = LANG_NAMES.get(lang, "English")
+    context_data = data.get("context", {})
+    
+    context_str = ""
+    if context_data:
+        lat, lon = context_data.get("lat"), context_data.get("lon")
+        weather = context_data.get("weather")
+        crops = context_data.get("crops")
+        
+        if lat and lon:
+            context_str += f"\n- User Location: approx. {lat}, {lon}"
+        if weather:
+            context_str += f"\n- Current Weather: {weather.get('temp', '?')}°C, {weather.get('humidity', '?')}% humidity"
+            if weather.get('city'):
+                context_str += f" in {weather.get('city')}"
+        if crops and isinstance(crops, list):
+            crop_names = [c.get("name") for c in crops[:3] if isinstance(c, dict)]
+            if crop_names:
+                context_str += f"\n- Recommended Crops for them: {', '.join(crop_names)}"
 
     system_prompt = f"""You are Kisan Helper, a friendly AI agricultural assistant for Indian farmers built into SmartAgro app.
 The user may write to you in ANY language or mix of languages — Hindi, English, Bengali, Tamil, or any other.
 No matter what language the user writes in, you MUST always reply ONLY in {lang_name}, using its native script (not transliteration).
-You help farmers with: crop diseases, weather advice, pesticide usage, market prices, government schemes (PM-KISAN, Fasal Bima Yojana, Kisan Credit Card), soil health, irrigation, seasonal crop recommendations.
+You help farmers with: crop diseases, weather advice, pesticide usage, market prices, government schemes, soil health, irrigation.
 Keep answers practical, simple, and farmer-friendly. Use bullet points for lists.
 Always be warm and address the farmer respectfully. Never use markdown headers. Keep responses under 200 words."""
 
+    if context_str:
+        system_prompt += f"\n\nContext about the user's current situation (use this if they ask about weather, location, or what to grow):{context_str}"
+
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     body = {
-        "model":       "openai/gpt-oss-120b",
+        "model":       "llama-3.3-70b-versatile",
         "messages":    [{"role": "system", "content": system_prompt}] + messages,
         "temperature": 0.7,
         "max_tokens":  400,
@@ -1308,7 +1401,6 @@ def get_alerts():
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 TRANSLATE_MODELS = [
-    "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
 ]

@@ -1043,12 +1043,20 @@ body.light-theme .kw-rec-hint   { color: #9ca3af; }
 
         const lang = getAppLang();
         const messagesPayload = [...chatHistory];
+        
+        // Gather available context
+        const chatContext = {
+            lat: sessionStorage.getItem('userLat'),
+            lon: sessionStorage.getItem('userLon'),
+            weather: window._lastWeatherData || null,
+            crops: window._lastCropData ? window._lastCropData.crops : null
+        };
 
         try {
             const res = await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ messages: messagesPayload, lang })
+                body: JSON.stringify({ messages: messagesPayload, lang, context: chatContext })
             });
 
             if (typingEl) typingEl.remove();

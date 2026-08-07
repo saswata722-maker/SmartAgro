@@ -229,6 +229,19 @@ function requestLocation() {
     }
     // Use navigator directly here for dashboard
     const btn = document.getElementById('locationBtn');
+
+    // Check session storage first
+    const savedLat = sessionStorage.getItem('userLat');
+    const savedLon = sessionStorage.getItem('userLon');
+    if (savedLat && savedLon) {
+        if (btn) {
+            btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
+            btn.style.background = 'linear-gradient(135deg,#166534,#22c55e)';
+        }
+        loadWeatherAndCrops(parseFloat(savedLat), parseFloat(savedLon));
+        return;
+    }
+
     if (btn) {
         btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>Getting location...</span>`;
         btn.disabled = true;
@@ -242,6 +255,8 @@ function requestLocation() {
 
     navigator.geolocation.getCurrentPosition(
         pos => {
+            sessionStorage.setItem('userLat', pos.coords.latitude);
+            sessionStorage.setItem('userLon', pos.coords.longitude);
             showToast('📍 Location detected!', 'success');
             if (btn) {
                 btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
