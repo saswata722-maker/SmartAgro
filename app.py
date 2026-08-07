@@ -46,7 +46,7 @@ DEBUG_MODE          = os.getenv("FLASK_DEBUG", "0") == "1"
 # later. This is the "proof of accuracy" pipeline: without stored
 # input/output pairs there is nothing to audit or compute real accuracy
 # metrics from, no matter what confidence number the model reports.
-DIAGNOSIS_LOG_DIR    = os.path.join(basedir, "diagnosis_logs")
+DIAGNOSIS_LOG_DIR    = os.getenv("DIAGNOSIS_LOG_DIR", os.path.join(os.path.expanduser("~"), "SmartAgro_Logs"))
 DIAGNOSIS_IMAGES_DIR = os.path.join(DIAGNOSIS_LOG_DIR, "images")
 DIAGNOSIS_LOG_PATH   = os.path.join(DIAGNOSIS_LOG_DIR, "log.jsonl")
 os.makedirs(DIAGNOSIS_IMAGES_DIR, exist_ok=True)
