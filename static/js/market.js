@@ -297,6 +297,7 @@ function renderMarketGrid(markets) {
     const changeLabel = _t('Change') || 'Change';
     const demandLabel = _t('Demand') || 'Demand';
     const cropsLabel = _t('crops') || 'crops';
+    const INITIAL_SHOW = 5;
 
     let hasVisible = false;
 
@@ -312,40 +313,44 @@ function renderMarketGrid(markets) {
                 if (filtered.length === 0) return '';
                 hasVisible = true;
 
+                const visibleCrops = filtered.slice(0, INITIAL_SHOW);
+                const hiddenCrops = filtered.slice(INITIAL_SHOW);
+                const cardId = `city-card-${cityIdx}`;
+                const sourceInfo = filtered[0]?.market ? filtered[0].market : '';
+                const arrivalDate = filtered[0]?.arrival_date || '';
+
                 return `
         <div class="city-card" style="animation-delay:${cityIdx * 0.05}s">
-            <div class="city-card-header">
+            <div class="city-card-header" onclick="toggleCityCard('${cardId}')" role="button" tabindex="0">
                 <div class="city-name">
                     <i class="fas fa-location-dot"></i> ${city}
+                    ${sourceInfo ? `<span class="city-source-info">${sourceInfo}</span>` : ''}
                 </div>
-                <span class="city-count">${filtered.length} ${cropsLabel}</span>
+                <div class="city-header-right">
+                    <span class="city-count">${filtered.length} ${cropsLabel}</span>
+                    <i class="fas fa-chevron-down city-chevron" id="${cardId}-chevron"></i>
+                </div>
             </div>
-            <div class="crop-rows">
-                <div class="crop-row-header" style="display:grid;grid-template-columns:1.5fr 1fr 80px 100px;padding:8px 20px;font-size:0.68rem;color:var(--text-3);font-weight:700;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid var(--border)">
-                    <span>${cropLabel}</span>
-                    <span>${priceLabel}</span>
-                    <span>${changeLabel}</span>
-                    <span class="cr-demand-hdr">${demandLabel}</span>
+            <div class="crop-rows-wrapper collapsed" id="${cardId}">
+                <div class="crop-rows">
+                    <div class="crop-row-header" style="display:grid;grid-template-columns:1.5fr 1fr 80px 100px;padding:8px 20px;font-size:0.68rem;color:var(--text-3);font-weight:700;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid var(--border)">
+                        <span>${cropLabel}</span>
+                        <span>${priceLabel}</span>
+                        <span>${changeLabel}</span>
+                        <span class="cr-demand-hdr">${demandLabel}</span>
+                    </div>
+                    ${visibleCrops.map(crop => renderCropRow(crop)).join('')}
+                    ${hiddenCrops.length > 0 ? `
+                    <div class="crop-rows-hidden" id="${cardId}-hidden" style="display:none">
+                        ${hiddenCrops.map(crop => renderCropRow(crop)).join('')}
+                    </div>
+                    <button class="show-more-btn" id="${cardId}-btn" onclick="event.stopPropagation(); toggleCropList('${cardId}')">
+                        <i class="fas fa-chevron-down"></i>
+                        <span>${_t('Show all') || 'Show all'} ${filtered.length} ${cropsLabel}</span>
+                    </button>
+                    ` : ''}
                 </div>
-                ${filtered.map(crop => {
-                    const isUp   = crop.change >= 0;
-                    const pctAbs = Math.abs(crop.change).toFixed(1);
-                   return `
-                    <div class="crop-row">
-                        <div class="cr-name" data-crop-key="${crop.crop_key || crop.crop}">${tCrop(crop.crop)}</div>
-                        <div>
-                            <div class="cr-price">₹${crop.price.toLocaleString('en-IN')}</div>
-                            <div class="cr-unit" data-translate-market="quintal">${_t('quintal') || crop.unit}</div>
-                        </div>
-                        <div class="cr-change ${isUp ? 'up' : 'down'}">
-                            <i class="fas fa-arrow-${isUp ? 'up' : 'down'}"></i>
-                            ${pctAbs}%
-                        </div>
-                        <div class="cr-demand demand-${getDemandClass(crop.demand)}" data-demand-key="${crop.demand}">
-                            ${tDemand(crop.demand)}
-                        </div>
-                    </div>`;
-                }).join('')}
+                ${arrivalDate ? `<div class="city-card-footer"><i class="fas fa-clock"></i> ${_t('Last updated') || 'Last updated'}: ${arrivalDate}</div>` : ''}
             </div>
         </div>`;
     }).join('');
@@ -358,6 +363,56 @@ function renderMarketGrid(markets) {
     setTimeout(() => {
         if (typeof observeAnimations === 'function') observeAnimations();
     }, 100);
+}
+
+function renderCropRow(crop) {
+    const isUp   = crop.change >= 0;
+    const pctAbs = Math.abs(crop.change).toFixed(1);
+    const marketName = crop.market || '';
+    return `
+        <div class="crop-row">
+            <div class="cr-name-wrap">
+                <div class="cr-name" data-crop-key="${crop.crop_key || crop.crop}">${tCrop(crop.crop)}</div>
+                ${marketName ? `<div class="cr-market-src"><i class="fas fa-store"></i> ${marketName}</div>` : ''}
+            </div>
+            <div>
+                <div class="cr-price">₹${crop.price.toLocaleString('en-IN')}</div>
+                <div class="cr-unit" data-translate-market="quintal">${_t('quintal') || crop.unit}</div>
+            </div>
+            <div class="cr-change ${isUp ? 'up' : 'down'}">
+                <i class="fas fa-arrow-${isUp ? 'up' : 'down'}"></i>
+                ${pctAbs}%
+            </div>
+            <div class="cr-demand demand-${getDemandClass(crop.demand)}" data-demand-key="${crop.demand}">
+                ${tDemand(crop.demand)}
+            </div>
+        </div>`;
+}
+
+function toggleCityCard(cardId) {
+    const wrapper = document.getElementById(cardId);
+    const chevron = document.getElementById(cardId + '-chevron');
+    if (!wrapper) return;
+    wrapper.classList.toggle('collapsed');
+    if (chevron) chevron.classList.toggle('rotated');
+}
+
+function toggleCropList(cardId) {
+    const hidden = document.getElementById(cardId + '-hidden');
+    const btn = document.getElementById(cardId + '-btn');
+    if (!hidden || !btn) return;
+    const isShowing = hidden.style.display !== 'none';
+    hidden.style.display = isShowing ? 'none' : '';
+    const icon = btn.querySelector('i');
+    const span = btn.querySelector('span');
+    if (icon) icon.className = isShowing ? 'fas fa-chevron-down' : 'fas fa-chevron-up';
+    if (span) {
+        const count = hidden.querySelectorAll('.crop-row').length;
+        const topCount = btn.closest('.crop-rows').querySelectorAll(':scope > .crop-row').length;
+        span.textContent = isShowing 
+            ? `${_t('Show all') || 'Show all'} ${topCount + count} ${_t('crops') || 'crops'}`
+            : `${_t('Show less') || 'Show less'}`;
+    }
 }
 
 function getDemandClass(demand) {
