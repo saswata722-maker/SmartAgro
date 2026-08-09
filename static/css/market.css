@@ -139,6 +139,7 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr));
   gap: 24px;
+  align-items: start;
 }
 
 /* City Card */
@@ -362,32 +363,6 @@
 .chart-city-select select:focus { border-color: var(--green); }
 .chart-canvas-wrap { padding: 24px; height: 360px; position: relative; }
 
-/* ── Price Table ────────────────────── */
-.table-wrapper { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); }
-.price-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; min-width: 900px; }
-.price-table th {
-  padding: 12px 16px;
-  background: var(--bg-3);
-  color: var(--text-2);
-  font-weight: 700;
-  text-align: right;
-  border-bottom: 1px solid var(--border);
-  white-space: nowrap;
-  font-size: 0.78rem;
-}
-.price-table th:first-child { text-align: left; }
-.price-table td {
-  padding: 12px 16px;
-  border-bottom: 1px solid rgba(74,222,128,0.05);
-  text-align: right;
-  color: var(--text);
-  font-weight: 500;
-}
-.price-table td:first-child { text-align: left; font-weight: 700; }
-.price-table tr:last-child td { border-bottom: none; }
-.price-table tr:hover td { background: rgba(74,222,128,0.03); }
-.price-table td.not-available { color: var(--text-3); font-size: 0.75rem; }
-
 /* Responsive */
 @media (max-width: 768px) {
   .market-cities-grid { grid-template-columns: 1fr; }
@@ -414,4 +389,4 @@
   .price-ticker { height: 38px; }
   .legend-bar { gap: 12px; }
   .legend-item { font-size: 0.72rem; }
-}
+}

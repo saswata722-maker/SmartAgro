@@ -36,8 +36,14 @@ app = Flask(__name__)
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
+# ── API keys / secrets — ALWAYS from environment (.env), never hardcoded ────
+# Every value below comes exclusively from os.getenv(). None of them has a
+# real credential baked in as a fallback default: if a variable is missing
+# from .env, the app runs with that feature degraded/disabled and prints a
+# warning at startup, rather than silently falling back to an embedded key.
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
+DATA_GOV_API_KEY    = os.getenv("DATA_GOV_API_KEY", "")
 DEBUG_MODE          = os.getenv("FLASK_DEBUG", "0") == "1"
 
 # ── Diagnosis QA logging ─────────────────────────────────────────────────
@@ -71,8 +77,13 @@ LANG_NAMES = {
     "bodo":"Bodo","doi":"Dogri","sa":"Sanskrit",
 }
 
-print(f"[AgroSmart] Groq key:    {'OK' if GROQ_API_KEY else 'MISSING'}")
-print(f"[AgroSmart] Weather key: {'OK' if OPENWEATHER_API_KEY else 'MISSING'}")
+# ── Startup diagnostics — report key status WITHOUT ever printing the
+# actual key values. Missing DATA_GOV_API_KEY is non-fatal (data.gov.in
+# allows limited public access), but Groq/Weather being missing means
+# those features simply won't work until .env is filled in.
+print(f"[AgroSmart] Groq key:      {'OK' if GROQ_API_KEY else 'MISSING — set GROQ_API_KEY in .env'}")
+print(f"[AgroSmart] Weather key:   {'OK' if OPENWEATHER_API_KEY else 'MISSING — set OPENWEATHER_API_KEY in .env'}")
+print(f"[AgroSmart] data.gov.in key: {'OK' if DATA_GOV_API_KEY else 'MISSING — set DATA_GOV_API_KEY in .env (get a free key at https://data.gov.in). Market data will use the offline fallback until then.'}")
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -98,6 +109,9 @@ def offline():
 # ─── Weather API ─────────────────────────────────────────────────────────────
 @app.route("/api/weather")
 def get_weather():
+    if not OPENWEATHER_API_KEY:
+        return jsonify({"error": "Weather is not configured on this server. Set OPENWEATHER_API_KEY in .env."}), 500
+
     lat = request.args.get("lat")
     lon = request.args.get("lon")
     if not lat or not lon:
@@ -440,12 +454,12 @@ def get_pesticide_guide(crops):
 # mandi produce) or hand-typed reference tables.
 #
 # Get a free personal key at https://data.gov.in (Sign Up -> My Account ->
-# API keys) and set it as DATA_GOV_API_KEY in your .env. Until you do, this
-# falls back to data.gov.in's shared public test key, which is rate-limited
-# and NOT meant for production — replace it as soon as you can.
-DATA_GOV_API_KEY = os.getenv("DATA_GOV_API_KEY", "579b464db66ec23bdd000001cdd394632e5c46e4b7067122d15f5d6f")
-if DATA_GOV_API_KEY == "579b464db66ec23bdd000001cdd394632e5c46e4b7067122d15f5d6f":
-    print("[AgroSmart] Using data.gov.in public test key — get your free personal key at https://data.gov.in")
+# API keys) and set it as DATA_GOV_API_KEY in your .env. Without a key set,
+# the app runs on the offline/dynamic MSP-reference fallback below instead
+# of ever falling back to any embedded key.
+if not DATA_GOV_API_KEY:
+    print("[AgroSmart] DATA_GOV_API_KEY not set — market prices will use the offline "
+          "MSP-reference fallback. Get a free personal key at https://data.gov.in")
 
 AGMARKNET_RESOURCE_ID = "9ef84268-d588-465a-a308-a864a43d0070"
 AGMARKNET_URL = f"https://api.data.gov.in/resource/{AGMARKNET_RESOURCE_ID}"
@@ -621,8 +635,12 @@ STATE_NAME_CANDIDATES = {
 
 def fetch_agmarknet_prices(state: str) -> list:
     """Fetch REAL, government-reported mandi (wholesale market) prices for a
-    state from data.gov.in's official Agmarknet dataset. Returns [] if the
-    feed has nothing usable right now (caller falls back to MSP reference)."""
+    state from data.gov.in's official Agmarknet dataset. Returns [] if no
+    key is configured or the feed has nothing usable right now (caller
+    falls back to the MSP reference in that case)."""
+    if not DATA_GOV_API_KEY:
+        return []
+
     now = time.monotonic()
     cached = _agmark_fetch_cache.get(state)
     if cached and (now - cached[0]) < AGMARK_CACHE_TTL_SEC:
@@ -723,10 +741,26 @@ def fetch_agmarknet_prices(state: str) -> list:
     return results
 
 
-def get_demand(price: int, change: float) -> str:
-    if change > 2:    return "Very High"
-    elif change > 0:  return "High"
-    elif change > -2: return "Medium"
+def get_demand(change: float, price_deviation_pct: float) -> str:
+    """Blend two independent signals so demand actually varies:
+
+    1. `change` — real day-over-day price movement (from Agmarknet history).
+       This alone is structurally flat on the FIRST data point recorded
+       each day: with only one point in history, prev_price == current
+       price, so change is 0.0 for literally every commodity that day —
+       which is why every crop used to show "Medium" until history had
+       accumulated a few days.
+    2. `price_deviation_pct` — how this market's price compares to the
+       average price for the same commodity across every other market in
+       the same response, right now. This signal exists from day one
+       (it doesn't need historical data at all), so it's what keeps
+       demand meaningfully different across cities/crops even before
+       day-over-day trends have had time to build up.
+    """
+    score = change + price_deviation_pct
+    if score > 3:     return "Very High"
+    elif score > 0.5: return "High"
+    elif score > -3:  return "Medium"
     else:             return "Low"
 
 
@@ -758,15 +792,33 @@ def get_market_data():
                 print(f"[Market] Unexpected error fetching {state}: {e}")
                 state_results_cache[state] = []
 
+    # Pull the raw per-city crop lists first (no demand assigned yet) so
+    # we can compute a cross-market average price per commodity BEFORE
+    # scoring demand for any individual city.
+    city_crop_lists = {}
     for city in cities:
         state = CITY_STATE.get(city, "")
         crops = list(state_results_cache.get(state, []))
         if not crops:
             crops = get_dynamic_mandi_fallback(city)
+        city_crop_lists[city] = crops
 
+    price_sum = {}
+    price_count = {}
+    for crops in city_crop_lists.values():
+        for c in crops:
+            key = c.get("crop_key") or c["crop"]
+            price_sum[key] = price_sum.get(key, 0) + c["price"]
+            price_count[key] = price_count.get(key, 0) + 1
+    avg_price_by_crop = {k: price_sum[k] / price_count[k] for k in price_sum}
+
+    for city in cities:
         city_crops = []
-        for crop in crops:
-            demand = get_demand(crop["price"], crop["change"])
+        for crop in city_crop_lists[city]:
+            key = crop.get("crop_key") or crop["crop"]
+            avg = avg_price_by_crop.get(key) or crop["price"]
+            deviation_pct = ((crop["price"] - avg) / avg) * 100 if avg else 0.0
+            demand = get_demand(crop["change"], deviation_pct)
             city_crops.append({**crop, "demand": demand})
 
         city_crops.sort(
@@ -792,6 +844,8 @@ def get_market_data():
 def debug_market():
     if not DEBUG_MODE:
         return jsonify({"error": "Not available in production. Set FLASK_DEBUG=1 in .env"}), 403
+    if not DATA_GOV_API_KEY:
+        return jsonify({"error": "DATA_GOV_API_KEY not set in .env"}), 500
     state = request.args.get('state', 'Delhi')
     try:
         resp = _agmark_session.get(
@@ -833,6 +887,9 @@ def _is_rate_limited(ip: str) -> bool:
 
 @app.route("/api/chat", methods=["POST"])
 def kisan_chat():
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY not set in .env"}), 500
+
     ip = request.remote_addr or "unknown"
     if _is_rate_limited(ip):
         return jsonify({"error": "Too many requests. Please wait a moment."}), 429
@@ -1536,6 +1593,9 @@ def _translate_terms_chunk(terms_chunk, lang_name, domain_note):
 def _translate_terms(terms, lang_name, domain_note, cache_key, cache_dict):
     """Translate a full term list via small, gently-paced parallel chunks,
     with caching and a cleanup retry pass for chunks that failed outright."""
+    if not GROQ_API_KEY:
+        return {term: term for term in terms}, False
+
     if cache_key in cache_dict:
         return cache_dict[cache_key], True
 

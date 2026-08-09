@@ -227,7 +227,6 @@ async function loadAllMarkets() {
         } else {
             renderMarketGrid(allMarketData);
             buildTicker(allMarketData);
-            buildPriceTable(allMarketData);
             buildChart(allMarketData, firstCity, 'line');
         }
 
@@ -456,7 +455,6 @@ async function searchLocation() {
 
     if (Object.keys(matched).length > 0) {
         renderMarketGrid(matched);
-        buildPriceTable(matched);
         const firstCity = Object.keys(matched)[0];
         currentChartCity = firstCity;
         buildChart(matched, firstCity, activeChartType);
@@ -477,7 +475,6 @@ async function searchLocation() {
             if (none) none.style.display = '';
         } else {
             renderMarketGrid(data.markets);
-            buildPriceTable(data.markets);
             const firstCity = data.locations[0];
             currentChartCity = firstCity;
             buildChart(data.markets, firstCity, activeChartType);
@@ -513,7 +510,6 @@ function clearSearch() {
         </div>`;
 
     renderMarketGrid(allMarketData);
-    buildPriceTable(allMarketData);
     buildChart(allMarketData, currentChartCity, activeChartType);
 }
 
@@ -890,62 +886,6 @@ function getBaseChartOptions(titleText) {
     };
 }
 
-/* ══════════════════════════════════════════════
-   PRICE COMPARISON TABLE
-══════════════════════════════════════════════ */
-function buildPriceTable(markets) {
-    const tbody = document.getElementById('priceTableBody');
-    if (!tbody) return;
-
-    const cities   = Object.keys(markets);
-    const cropSet  = new Set();
-    Object.values(markets).forEach(crops => crops.forEach(c => cropSet.add(c.crop)));
-    const allCrops = Array.from(cropSet).sort();
-
-    const lookup = {};
-    Object.entries(markets).forEach(([city, crops]) => {
-        lookup[city] = {};
-        crops.forEach(c => { lookup[city][c.crop] = c; });
-    });
-
-    const displayCities = cities.slice(0, 10);
-
-    tbody.innerHTML = allCrops.map(cropName => {
-        const cells = displayCities.map(city => {
-            const item = lookup[city]?.[cropName];
-            if (!item) return `<td class="not-available">—</td>`;
-
-            const color  = item.change >= 2  ? '#4ade80' :
-                           item.change <= -2 ? '#f87171' : 'var(--text)';
-            const arrow  = item.change >= 0.5  ? '▲' :
-                           item.change <= -0.5 ? '▼' : '–';
-            const dClass = getDemandClass(item.demand);
-            return `
-            <td>
-                <div style="color:${color};font-weight:700">
-                    ₹${item.price.toLocaleString('en-IN')}
-                    <span style="font-size:0.62rem;opacity:0.7"> ${arrow}</span>
-                </div>
-                <div class="cr-demand demand-${dClass}" style="display:inline-flex;font-size:0.58rem;padding:1px 5px;margin-top:2px">
-                    ${tDemand(item.demand)}
-                </div>
-            </td>`;
-        });
-
-        return `<tr>
-            <td><strong>${tCrop(cropName)}</strong></td>
-            ${cells.join('')}
-        </tr>`;
-    }).join('');
-
-    const thead = document.querySelector('.price-table thead tr');
-    if (thead) {
-        thead.innerHTML =
-            `<th>${_t('Crop') || 'Crop'}</th>` +
-            displayCities.map(c => `<th>${c}</th>`).join('');
-    }
-}
-
 function reRenderMarket() {
     if (Object.keys(allMarketData).length === 0) return;
 
@@ -957,7 +897,6 @@ function reRenderMarket() {
 
     renderMarketGrid(allMarketData);
     buildTicker(allMarketData);
-    buildPriceTable(allMarketData);
     buildChart(allMarketData, currentChartCity, activeChartType);
 }
 
