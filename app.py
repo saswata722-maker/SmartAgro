@@ -1230,19 +1230,43 @@ Respond ONLY with valid JSON, no markdown or backticks:
     # that model twice at different temperatures as a self-consistency
     # cross-check, which is the honest equivalent given only one
     # production-viable Groq vision model currently exists.
+    #
+    # The passes are independent (same image, different temperature/model),
+    # so they're fired off in parallel via ThreadPoolExecutor rather than
+    # awaited one-by-one — this is a pure I/O-bound wait on the Groq API,
+    # so running them concurrently cuts a farmer's wait roughly in half
+    # instead of paying for each pass's latency back-to-back.
     pass_temperatures = [0.2, 0.6, 0.9]
-    results, models_used = [], []
-    for i in range(ENSEMBLE_PASSES):
-        model = vision_models[i % len(vision_models)]
-        temp  = pass_temperatures[i % len(pass_temperatures)]
+    pass_plan = [
+        (i, vision_models[i % len(vision_models)], pass_temperatures[i % len(pass_temperatures)])
+        for i in range(ENSEMBLE_PASSES)
+    ]
+    pass_outcomes = [None] * ENSEMBLE_PASSES  # preserve original pass order in results
+
+    def _run_pass(i, model, temp):
         try:
-            parsed = _run_vision_pass(image_b64, prompt, sys_prompt, model, temp)
-            if parsed and parsed.get("disease"):
-                results.append(parsed)
-                models_used.append(model)
+            return _run_vision_pass(image_b64, prompt, sys_prompt, model, temp)
         except Exception as e:
             print(f"[Diagnose] pass {i} ({model}) failed: {e}")
-            continue
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=ENSEMBLE_PASSES) as executor:
+        future_to_pass = {
+            executor.submit(_run_pass, i, model, temp): (i, model)
+            for i, model, temp in pass_plan
+        }
+        for future in concurrent.futures.as_completed(future_to_pass):
+            i, model = future_to_pass[future]
+            parsed = future.result()
+            if parsed and parsed.get("disease"):
+                pass_outcomes[i] = (parsed, model)
+
+    results, models_used = [], []
+    for outcome in pass_outcomes:
+        if outcome is not None:
+            parsed, model = outcome
+            results.append(parsed)
+            models_used.append(model)
 
     if not results:
         return jsonify({"error": "All vision models failed. Check your GROQ_API_KEY in .env"}), 500

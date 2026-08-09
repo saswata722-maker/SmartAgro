@@ -33,6 +33,7 @@ venv.bak/
 secrets.json
 *.pem
 *.key
+market_history_cache.json
 
 # ── IDE / Editor ────────────────────────────────────────────────────────────
 .vscode/
