@@ -496,20 +496,32 @@ AGMARK_COMMODITY_ALIASES = {
     "banana": "Banana", "mango": "Mango",
 }
 
-# Reference prices — used ONLY on the rare day a state's mandis haven't
-# reported anything yet (Agmarknet is govt.-updated once daily; occasional
-# gaps happen on holidays). Clearly tagged as "msp_fallback" so the UI badge
-# tells the farmer these are reference, not live, prices.
-MSP_FALLBACK = [
-    {"crop": "Wheat",             "price": 2275,  "change": 0.0},
-    {"crop": "Rice",              "price": 2183,  "change": 0.0},
-    {"crop": "Maize (Corn)",      "price": 2090,  "change": 0.0},
-    {"crop": "Mustard",           "price": 5650,  "change": 0.0},
-    {"crop": "Groundnut",         "price": 6377,  "change": 0.0},
-    {"crop": "Onion",             "price": 1800,  "change": 0.0},
-    {"crop": "Potato",            "price": 1200,  "change": 0.0},
-    {"crop": "Tomato",            "price": 2500,  "change": 0.0},
-    {"crop": "Bengal Gram (Chana)", "price": 5440, "change": 0.0},
+# Reference prices — the SINGLE source of truth for the offline/MSP-style
+# fallback, used both as the static reference table and as the base prices
+# get_dynamic_mandi_fallback() varies day-to-day. Used ONLY on the rare day
+# a state's mandis haven't reported anything yet (Agmarknet is
+# govt.-updated once daily; occasional gaps happen on holidays), or when no
+# DATA_GOV_API_KEY is configured at all. Clearly tagged as "msp_fallback" so
+# the UI badge tells the farmer these are reference, not live, prices.
+#
+# NOTE: previously this list existed twice — once here (9 crops, never
+# actually read by any code) and again as a separate hardcoded `base_crops`
+# list inside get_dynamic_mandi_fallback() (12 crops, including Cotton/
+# Soybean/Sugarcane that this list was missing). They're merged into this
+# one list so there's exactly one place to add/edit a reference crop price.
+MSP_REFERENCE_PRICES = [
+    {"crop": "Wheat",               "base_price": 2275},
+    {"crop": "Rice",                "base_price": 2183},
+    {"crop": "Maize (Corn)",        "base_price": 2090},
+    {"crop": "Mustard",             "base_price": 5650},
+    {"crop": "Groundnut",           "base_price": 6377},
+    {"crop": "Onion",               "base_price": 1800},
+    {"crop": "Potato",              "base_price": 1200},
+    {"crop": "Tomato",              "base_price": 2500},
+    {"crop": "Bengal Gram (Chana)", "base_price": 5440},
+    {"crop": "Cotton",              "base_price": 6120},
+    {"crop": "Soybean",             "base_price": 4400},
+    {"crop": "Sugarcane",           "base_price": 3150},
 ]
 
 
@@ -518,23 +530,9 @@ def get_dynamic_mandi_fallback(city):
     when data.gov.in API key is unconfigured or rate-limited."""
     import hashlib
     today_str = datetime.now().strftime("%Y-%m-%d")
-    base_crops = [
-        {"crop": "Wheat",               "base_price": 2275},
-        {"crop": "Rice",                "base_price": 2183},
-        {"crop": "Maize (Corn)",        "base_price": 2090},
-        {"crop": "Mustard",             "base_price": 5650},
-        {"crop": "Groundnut",           "base_price": 6377},
-        {"crop": "Onion",               "base_price": 1800},
-        {"crop": "Potato",              "base_price": 1200},
-        {"crop": "Tomato",              "base_price": 2500},
-        {"crop": "Bengal Gram (Chana)", "base_price": 5440},
-        {"crop": "Cotton",              "base_price": 6120},
-        {"crop": "Soybean",             "base_price": 4400},
-        {"crop": "Sugarcane",           "base_price": 3150},
-    ]
 
     results = []
-    for c in base_crops:
+    for c in MSP_REFERENCE_PRICES:
         seed_str = f"{city}_{c['crop']}_{today_str}"
         seed_num = int(hashlib.md5(seed_str.encode('utf-8')).hexdigest(), 16)
         pct_var = ((seed_num % 1000) / 1000.0 - 0.45) * 0.06
@@ -633,19 +631,12 @@ STATE_NAME_CANDIDATES = {
 }
 
 
-def fetch_agmarknet_prices(state: str) -> list:
-    """Fetch REAL, government-reported mandi (wholesale market) prices for a
-    state from data.gov.in's official Agmarknet dataset. Returns [] if no
-    key is configured or the feed has nothing usable right now (caller
-    falls back to the MSP reference in that case)."""
-    if not DATA_GOV_API_KEY:
-        return []
-
-    now = time.monotonic()
-    cached = _agmark_fetch_cache.get(state)
-    if cached and (now - cached[0]) < AGMARK_CACHE_TTL_SEC:
-        return cached[1]
-
+def _fetch_state_commodities_raw(state: str) -> dict:
+    """HTTP fetch + parse ONLY — deliberately does NOT touch the on-disk
+    price-history cache. Returns {display_name: {market, district,
+    arrival_date, modal_price}}, or {} if nothing usable was found for this
+    state. Safe to call from multiple threads concurrently since it only
+    does network I/O, no shared file access."""
     records = []
     for candidate in STATE_NAME_CANDIDATES.get(state, [state]):
         params = {
@@ -673,7 +664,7 @@ def fetch_agmarknet_prices(state: str) -> list:
 
     if not records:
         print(f"[Market] Agmarknet: no usable records for {state} after trying all name variants")
-        return []
+        return {}
 
     # Log the exact keys of the first record once, so if parsing still
     # fails you can see the real field names by checking your app logs.
@@ -706,39 +697,97 @@ def fetch_agmarknet_prices(state: str) -> list:
 
     print(f"[Market] {state}: parsed {len(latest_by_commodity)} commodities, "
           f"skipped {skipped_no_price} records (missing/invalid price or name)")
+    return latest_by_commodity
 
+
+def fetch_agmarknet_prices_bulk(states: list) -> dict:
+    """Fetch REAL, government-reported mandi prices for MULTIPLE states at
+    once. HTTP calls still run in parallel (one thread per state), but the
+    on-disk price-history cache is now read ONCE, updated in memory for
+    every state in this batch, and written ONCE — instead of the old
+    behaviour where every parallel worker thread independently read and
+    rewrote the *entire* history file for its own single state. With ~13
+    states that used to mean 13 full file reads + 13 full file rewrites per
+    /api/market call; this collapses it to 1 read + 1 write per call.
+    Returns {state: [crop_result, ...]}."""
+    if not DATA_GOV_API_KEY:
+        return {s: [] for s in states}
+
+    now = time.monotonic()
+    results_by_state = {}
+    states_to_fetch = []
+    for s in states:
+        cached = _agmark_fetch_cache.get(s)
+        if cached and (now - cached[0]) < AGMARK_CACHE_TTL_SEC:
+            results_by_state[s] = cached[1]
+        else:
+            states_to_fetch.append(s)
+
+    if not states_to_fetch:
+        return results_by_state  # everything served from cache — zero file I/O this call
+
+    # ── Phase 1: HTTP fetch + parse, in parallel, no shared file access ──
+    raw_by_state = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(states_to_fetch) or 1)) as executor:
+        future_to_state = {executor.submit(_fetch_state_commodities_raw, s): s for s in states_to_fetch}
+        for future in concurrent.futures.as_completed(future_to_state):
+            state = future_to_state[future]
+            try:
+                raw_by_state[state] = future.result()
+            except Exception as e:
+                print(f"[Market] Unexpected error fetching {state}: {e}")
+                raw_by_state[state] = {}
+
+    # ── Phase 2: ONE load, update every state in memory, ONE save ───────
     today_key = datetime.now().strftime("%Y-%m-%d")
-    results = []
     with _agmark_history_lock:
-        cache = _load_history_cache()
-        state_hist = cache.setdefault(state, {})
+        cache = _load_history_cache()  # single read for the whole batch
 
-        for display_name, rec in latest_by_commodity.items():
-            hist = state_hist.setdefault(display_name, [])
-            if not hist or hist[-1].get("date") != today_key:
-                hist.append({"date": today_key, "price": rec["modal_price"]})
-                hist[:] = hist[-30:]  # keep the last 30 real daily points
+        for state in states_to_fetch:
+            latest_by_commodity = raw_by_state.get(state) or {}
+            state_hist = cache.setdefault(state, {})
+            state_results = []
 
-            prev_price = hist[-2]["price"] if len(hist) > 1 else rec["modal_price"]
-            change = round(((rec["modal_price"] - prev_price) / prev_price) * 100, 2) if prev_price else 0.0
+            for display_name, rec in latest_by_commodity.items():
+                hist = state_hist.setdefault(display_name, [])
+                if not hist or hist[-1].get("date") != today_key:
+                    hist.append({"date": today_key, "price": rec["modal_price"]})
+                    hist[:] = hist[-30:]  # keep the last 30 real daily points
 
-            results.append({
-                "crop":         display_name,
-                "crop_key":     display_name,
-                "price":        int(round(rec["modal_price"])),
-                "change":       change,
-                "history":      [h["price"] for h in hist] or [rec["modal_price"]],
-                "unit":         "Rs/quintal",
-                "source":       "agmarknet_live",
-                "market":       rec["market"],
-                "district":     rec["district"],
-                "arrival_date": rec["arrival_date"],
-            })
-        _save_history_cache(cache)
+                prev_price = hist[-2]["price"] if len(hist) > 1 else rec["modal_price"]
+                change = round(((rec["modal_price"] - prev_price) / prev_price) * 100, 2) if prev_price else 0.0
 
-    _agmark_fetch_cache[state] = (now, results)
-    print(f"[Market] Agmarknet OK for {state}: {len(results)} commodities")
-    return results
+                state_results.append({
+                    "crop":         display_name,
+                    "crop_key":     display_name,
+                    "price":        int(round(rec["modal_price"])),
+                    "change":       change,
+                    "history":      [h["price"] for h in hist] or [rec["modal_price"]],
+                    "unit":         "Rs/quintal",
+                    "source":       "agmarknet_live",
+                    "market":       rec["market"],
+                    "district":     rec["district"],
+                    "arrival_date": rec["arrival_date"],
+                })
+
+            results_by_state[state] = state_results
+            _agmark_fetch_cache[state] = (now, state_results)
+            print(f"[Market] Agmarknet OK for {state}: {len(state_results)} commodities")
+
+        _save_history_cache(cache)  # single write for the whole batch
+
+    return results_by_state
+
+
+def fetch_agmarknet_prices(state: str) -> list:
+    """Single-state convenience wrapper, kept for backward compatibility.
+    Internally delegates to the batched fetch — prefer
+    fetch_agmarknet_prices_bulk() directly when fetching multiple states,
+    since calling this in a loop would go back to one file I/O cycle per
+    call."""
+    if not DATA_GOV_API_KEY:
+        return []
+    return fetch_agmarknet_prices_bulk([state]).get(state, [])
 
 
 def get_demand(change: float, price_deviation_pct: float) -> str:
@@ -780,17 +829,11 @@ def get_market_data():
     # doing this sequentially could mean the whole page waits 12s x 13
     # states in the worst case. Parallel fetching caps total wait time to
     # roughly one slowest request instead of the sum of all of them.
+    # fetch_agmarknet_prices_bulk() does the HTTP fan-out itself AND
+    # batches the price-history file read/write into a single cycle for
+    # the whole call, instead of one file read + write per state thread.
     unique_states = sorted({CITY_STATE.get(c, "") for c in cities})
-    state_results_cache = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(unique_states) or 1)) as executor:
-        future_to_state = {executor.submit(fetch_agmarknet_prices, s): s for s in unique_states}
-        for future in concurrent.futures.as_completed(future_to_state):
-            state = future_to_state[future]
-            try:
-                state_results_cache[state] = future.result()
-            except Exception as e:
-                print(f"[Market] Unexpected error fetching {state}: {e}")
-                state_results_cache[state] = []
+    state_results_cache = fetch_agmarknet_prices_bulk(unique_states)
 
     # Pull the raw per-city crop lists first (no demand assigned yet) so
     # we can compute a cross-market average price per commodity BEFORE
@@ -1167,6 +1210,97 @@ def _log_diagnosis(record):
         print(f"[DiagnosisLog] Could not write log entry: {e}")
 
 
+# ── Diagnosis dedup cache: same photo re-submitted? ────────────────────
+# A farmer retrying — or the UI re-sending the exact same photo after a
+# hiccup — used to re-pay the FULL pipeline every time: pre-classifier
+# call, both ensemble passes, image re-save and a new log line, from
+# scratch. Identical bytes are identified exactly by their SHA-256 (a
+# large margin over the 12-char short hash already embedded in image
+# filenames), so a cheap lookup short-circuits all of that and replays the
+# stored diagnosis. Language is part of the key: re-submitting the SAME
+# photo in a different language still runs a fresh (correctly worded)
+# diagnosis instead of replaying a wrong-language answer.
+DIAGNOSIS_CACHE_TTL_SEC     = int(os.getenv("DIAGNOSIS_CACHE_TTL_SEC", str(7 * 24 * 3600)))  # 7 days, override-able via .env
+DIAGNOSIS_CACHE_MAX_ENTRIES = 500
+DIAGNOSIS_LOG_TAIL_BYTES    = 1 * 1024 * 1024  # restart-persistence scan only reads the newest ~1MB of the log
+
+_diagnosis_dedup_cache = {}       # f"{sha256}|{lang}" -> {"id", "ts", "response"}
+_diagnosis_dedup_lock  = threading.Lock()
+
+
+def _diagnosis_cache_key(image_sha256, lang):
+    return f"{image_sha256}|{lang}"
+
+
+def _store_cached_diagnosis(cache_key, record):
+    """Remember a fresh diagnosis so an identical resubmission within the
+    TTL window short-circuits instead of re-paying the whole pipeline."""
+    with _diagnosis_dedup_lock:
+        _diagnosis_dedup_cache[cache_key] = record
+        if len(_diagnosis_dedup_cache) > DIAGNOSIS_CACHE_MAX_ENTRIES:
+            now = time.time()
+            for k in [k for k, v in _diagnosis_dedup_cache.items()
+                      if now - v["ts"] >= DIAGNOSIS_CACHE_TTL_SEC]:
+                _diagnosis_dedup_cache.pop(k, None)   # drop expired entries first
+            while len(_diagnosis_dedup_cache) > DIAGNOSIS_CACHE_MAX_ENTRIES:
+                _diagnosis_dedup_cache.pop(next(iter(_diagnosis_dedup_cache)))  # then oldest
+
+
+def _find_cached_diagnosis(cache_key):
+    """Return a stored diagnosis record for identical image bytes+lang, or
+    None. Fast path is the in-memory dict (zero I/O). On a miss we scan
+    only the TAIL of the JSONL audit log (newest entries) so a cache that
+    was seeded before a process restart still short-circuits correctly —
+    bounded to DIAGNOSIS_LOG_TAIL_BYTES instead of an ever-growing O(whole
+    log) read. Records that can't qualify are skipped: cache-hit audit
+    entries, other languages, and pre-dedup entries that lack an image
+    hash entirely."""
+    now = time.time()
+    image_sha, lang = cache_key.split("|", 1)
+    with _diagnosis_dedup_lock:
+        hit = _diagnosis_dedup_cache.get(cache_key)
+        if hit:
+            if (now - hit["ts"]) < DIAGNOSIS_CACHE_TTL_SEC:
+                return hit
+            _diagnosis_dedup_cache.pop(cache_key, None)
+
+    try:
+        size = os.path.getsize(DIAGNOSIS_LOG_PATH)
+        if size > DIAGNOSIS_LOG_TAIL_BYTES:
+            with open(DIAGNOSIS_LOG_PATH, "rb") as f:
+                f.seek(size - DIAGNOSIS_LOG_TAIL_BYTES)
+                f.readline()  # drop the partial first line at the cut boundary
+                chunk = f.read().decode("utf-8", errors="replace")
+        else:
+            with open(DIAGNOSIS_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                chunk = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+
+    for line in reversed(chunk.splitlines()):   # newest record first
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if rec.get("cached") or rec.get("lang") != lang or rec.get("image_sha256") != image_sha:
+            continue
+        if not rec.get("response"):
+            continue
+        try:
+            ts = datetime.fromisoformat(rec["timestamp"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (now - ts) >= DIAGNOSIS_CACHE_TTL_SEC:
+            return None   # newest match is already stale — nothing older can be fresher
+        found = {"id": rec["id"], "ts": ts, "response": rec["response"]}
+        with _diagnosis_dedup_lock:
+            _diagnosis_dedup_cache[cache_key] = found
+        return found
+    return None
+
+
 @app.route("/api/diagnose", methods=["POST"])
 def diagnose_crop():
     if not GROQ_API_KEY:
@@ -1185,7 +1319,43 @@ def diagnose_crop():
     if len(image_b64) > MAX_IMAGE_B64_LEN:
         return jsonify({"error": "Image too large. Please use an image under 1 MB."}), 413
 
-    # ── Step 1: cheap pre-classifier — reject non-crop photos early ─────
+    # ── Step 1: dedup — has this EXACT image+language been diagnosed ─────
+    # recently? Re-submitting the same photo (UI retry, double-tap, farmer
+    # re-trying) used to re-pay for the pre-classifier, both ensemble
+    # passes, an image re-save and a fresh log line every single time. The
+    # SHA-256 of the decoded bytes identifies identical photos exactly, so
+    # a cheap lookup short-circuits all of that and replays the stored
+    # diagnosis. Language is part of the key so a same-photo request in
+    # another language still gets a freshly-worded answer. Non-crop
+    # rejections are deliberately NOT cached (that 422 short-circuits
+    # before this point) so the cheap classifier re-checks each time.
+    try:
+        image_raw = base64.b64decode(image_b64)
+    except Exception:
+        return jsonify({"error": "Image data is not valid base64"}), 400
+    image_sha256 = hashlib.sha256(image_raw).hexdigest()
+    cache_key = _diagnosis_cache_key(image_sha256, lang)
+
+    cached = _find_cached_diagnosis(cache_key)
+    if cached:
+        response = dict(cached["response"])
+        response["cached"]      = True
+        response["cached_from"] = cached["id"]
+        # Lightweight audit entry so the QA log still shows the re-request
+        # happened — without re-saving the image or running any model call.
+        _log_diagnosis({
+            "id":           f"{int(time.time()*1000)}_{ip.replace('.', '-').replace(':', '-')}",
+            "timestamp":    datetime.now().isoformat(),
+            "ip":           ip,
+            "lang":         lang,
+            "image_sha256": image_sha256,
+            "cached":       True,
+            "cached_from":  cached["id"],
+        })
+        print(f"[Diagnose] cache hit ({lang}) for image {image_sha256[:12]} — reused record {cached['id']}")
+        return jsonify(response)
+
+    # ── Step 2: cheap pre-classifier — reject non-crop photos early ─────
     is_plant, reject_reason = ai_is_crop_image(image_b64)
     if not is_plant:
         return jsonify({
@@ -1223,7 +1393,7 @@ Respond ONLY with valid JSON, no markdown or backticks:
     if lang != "en" and lang_name:
         sys_prompt += f" All free-text values must be in {lang_name}."
 
-    # ── Step 2: ensemble / self-consistency passes ──────────────────────
+    # ── Step 3: ensemble / self-consistency passes ──────────────────────
     # Cycling through `vision_models` means this automatically becomes a
     # true multi-model ensemble the moment a second entry is added there;
     # with a single model configured (today's reality) it instead runs
@@ -1271,7 +1441,7 @@ Respond ONLY with valid JSON, no markdown or backticks:
     if not results:
         return jsonify({"error": "All vision models failed. Check your GROQ_API_KEY in .env"}), 500
 
-    # ── Step 3: merge / vote across passes ───────────────────────────────
+    # ── Step 4: merge / vote across passes ───────────────────────────────
     primary = max(results, key=lambda r: r.get("confidence", 0))
     others  = [r for r in results if r is not primary]
 
@@ -1302,7 +1472,10 @@ Respond ONLY with valid JSON, no markdown or backticks:
     if alternate_diagnosis:
         primary["alternate_diagnosis"] = alternate_diagnosis
 
-    # ── Step 4: log image + full result for human spot-checking ─────────
+    # ── Step 5: log image + full result for human spot-checking ─────────
+    # The record now also stores the image's full SHA-256 and the exact
+    # response payload — both are what make a later identical re-submission
+    # resolvable as a cache hit (and keep the QA log fully replayable).
     record_id = f"{int(time.time()*1000)}_{ip.replace('.', '-').replace(':', '-')}"
     image_filename = _save_diagnosis_image(image_b64, record_id)
     _log_diagnosis({
@@ -1310,6 +1483,7 @@ Respond ONLY with valid JSON, no markdown or backticks:
         "timestamp":            datetime.now().isoformat(),
         "ip":                   ip,
         "lang":                 lang,
+        "image_sha256":         image_sha256,
         "models_used":          models_used,
         "passes_run":           len(results),
         "model_agreement":      agreement,
@@ -1319,8 +1493,17 @@ Respond ONLY with valid JSON, no markdown or backticks:
         "severity":             primary.get("severity"),
         "image_file":           image_filename,
         "raw_results":          results,   # every pass' full untouched output
+        "response":             primary,   # exact JSON the API returned (replay source for dedup)
         "human_reviewed":       False,     # a reviewer can flip this after checking the image
         "human_verdict":        None,      # "correct" | "incorrect" | "uncertain"
+    })
+
+    # Seed the dedup cache so an identical resubmission within the TTL
+    # window short-circuits without even touching the log file.
+    _store_cached_diagnosis(cache_key, {
+        "id":       record_id,
+        "ts":       time.time(),
+        "response": primary,
     })
 
     return jsonify(primary)
@@ -1418,6 +1601,8 @@ def diagnose_log_accuracy():
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if rec.get("cached"):
+                    continue   # dedup replay entries aren't independent diagnoses
                 total += 1
                 if rec.get("human_reviewed"):
                     reviewed += 1
