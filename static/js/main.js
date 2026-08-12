@@ -39,6 +39,27 @@ function showToast(msg, type = 'success', duration = 3500) {
     }, duration);
 }
 
+/* ── Skeleton loaders (#9) ────────────────────
+   Show shimmering placeholder cards in a container while a slow AI / network
+   call is in flight, so the page reads as "loading" instead of frozen. The
+   real render function replaces the container's innerHTML when data arrives.
+   Types: 'crop' | 'calendar' | 'market' | 'block' */
+function skeletonHTML(count, type) {
+    const el = t => {
+        if (t === 'crop')   return '<div class="skeleton skeleton-crop"></div>';
+        if (t === 'calendar') return '<div class="skeleton skeleton-timeline"></div>';
+        if (t === 'market') return '<div class="skeleton skeleton-market"></div>';
+        return '<div class="skeleton skeleton-block"></div>';
+    };
+    let html = '';
+    for (let i = 0; i < count; i++) html += el(type);
+    return html;
+}
+function showSkeleton(targetId, count, type) {
+    const el = document.getElementById(targetId);
+    if (el) el.innerHTML = skeletonHTML(count, type);
+}
+
 /* ── Shared weather state ───────────────────── */
 window.weatherData = null;
 
