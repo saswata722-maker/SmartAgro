@@ -451,6 +451,12 @@ async function analyzeImage() {
                            border-radius:50px;color:var(--text-3);animation:fadeInUp 0.3s ease ${i*0.15}s both">${s}</span>
             `).join('')}
           </div>
+          <!-- Skeleton rows (#9) while the AI ensemble runs -->
+          <div style="margin-top:20px;width:100%;max-width:440px;display:flex;flex-direction:column;gap:10px">
+            <div class="skeleton skeleton-block"></div>
+            <div class="skeleton skeleton-block"></div>
+            <div class="skeleton skeleton-block"></div>
+          </div>
         </div>`;
     }
 
@@ -614,6 +620,22 @@ async function renderDiagnosisResults(data) {
           </span>`;
     }
 
+    // ── Models used (#4) ──
+    // When Gemini is configured the backend returns the actual models that
+    // produced the answer (e.g. qwen/qwen3.6-27b + gemini:gemini-3.1-flash-lite).
+    let modelsBadge = '';
+    const modList = data._models_used || [];
+    if (modList.length) {
+        const names = modList.map(m => m.indexOf('gemini:') === 0
+            ? '<span style="color:#8e7cff">gemini</span>'
+            : m).join(' + ');
+        modelsBadge = `
+          <span class="result-badge" title="${modList.join(', ').replace(/"/g, '&quot;')}"
+                style="background:rgba(45,212,191,0.08);border:1px solid rgba(45,212,191,0.22);color:var(--teal)">
+            <i class="fas fa-microchip"></i> ${names}
+          </span>`;
+    }
+
     panel.innerHTML = `
     <div class="results-content">
 
@@ -631,7 +653,7 @@ async function renderDiagnosisResults(data) {
           <span class="result-badge" style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);color:var(--amber)">
             <i class="fas fa-leaf"></i> ${affectedPart}
           </span>` : ''}
-          ${agreementBadge}
+          ${agreementBadge}${modelsBadge}
         </div>
       </div>
 
