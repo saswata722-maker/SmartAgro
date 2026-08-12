@@ -9,6 +9,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Leaflet (satellite NDVI map) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <!-- PWA -->
   <link rel="manifest" href="/static/manifest.json"/>
   <meta name="theme-color" content="#4ade80"/>
@@ -140,6 +143,36 @@
     <div class="stat-item">
       <i class="fas fa-gauge-high"></i>
       <div><span class="stat-val" id="statPressure">--</span><span class="stat-label" data-translate="stat_pressure">Pressure</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════ SATELLITE VEGETATION HEALTH ═══════════════════════════ -->
+<section class="section ndvi-section" id="ndviSection" style="display:none">
+  <div class="container">
+    <div class="section-header">
+      <div class="section-tag"><i class="fas fa-satellite"></i></div>
+      <h2 data-translate="section_ndvi">Satellite Vegetation Health</h2>
+      <p data-translate="section_ndvi_sub">Live NDVI from Sentinel-2 for your farm area</p>
+    </div>
+    <div class="ndvi-layout">
+      <div class="ndvi-map-wrap">
+        <div id="ndviMap"></div>
+        <div class="ndvi-map-tag">Satellite view (Esri World Imagery)</div>
+      </div>
+      <div class="ndvi-card">
+        <div class="ndvi-gauge-wrap">
+          <svg class="ndvi-gauge" viewBox="0 0 200 110">
+            <path d="M20 100 A 80 80 0 0 1 180 100" fill="none" stroke="rgba(74,222,128,0.15)" stroke-width="14" stroke-linecap="round"/>
+            <path id="ndviArc" d="M20 100 A 80 80 0 0 1 180 100" fill="none" stroke="var(--green)" stroke-width="14" stroke-linecap="round" style="stroke-dasharray:251.3;stroke-dashoffset:251.3"/>
+            <text id="ndviVal" x="100" y="72" text-anchor="middle" style="font-size:34px;font-weight:800;fill:var(--text)">--</text>
+            <text x="100" y="95" text-anchor="middle" style="font-size:12px;fill:var(--text-3)">NDVI</text>
+          </svg>
+        </div>
+        <div class="ndvi-status" id="ndviStatus">Checking vegetation...</div>
+        <div class="ndvi-meta" id="ndviMeta"></div>
+        <div class="ndvi-source" id="ndviSource"></div>
+      </div>
     </div>
   </div>
 </section>

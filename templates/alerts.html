@@ -203,6 +203,27 @@
   </div>
 </section>
 
+<!-- ═══════════════════════ ADVISORY OUTLOOK (multi-period alerts) ═══════════════════════ -->
+<section class="section outlook-section" id="outlookSection" style="display:none">
+  <div class="container">
+    <div class="section-header">
+      <div class="section-tag"><i class="fas fa-calendar-week"></i></div>
+      <h2 data-translate="outlook_title">Advisory Outlook</h2>
+      <p data-translate="outlook_sub">6-day forecast, 30-day outlook, seasonal plans & per-crop risk</p>
+    </div>
+    <div class="outlook-tabs">
+      <button class="outlook-tab active" data-horizon="forecast" onclick="switchHorizon('forecast')">6-Day</button>
+      <button class="outlook-tab" data-horizon="monthly" onclick="switchHorizon('monthly')">30-Day</button>
+      <button class="outlook-tab" data-horizon="seasonal" onclick="switchHorizon('seasonal')">Seasonal</button>
+      <button class="outlook-tab" data-horizon="croprisk" onclick="switchHorizon('croprisk')">Crop Risk</button>
+    </div>
+    <div class="outlook-pane" id="outlookForecast"></div>
+    <div class="outlook-pane" id="outlookMonthly" style="display:none"></div>
+    <div class="outlook-pane" id="outlookSeasonal" style="display:none"></div>
+    <div class="outlook-pane" id="outlookCropRisk" style="display:none"></div>
+  </div>
+</section>
+
 <!-- ═══════════════════════ FOOTER ═══════════════════════ -->
 <footer class="footer">
   <div class="container">

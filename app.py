@@ -43,8 +43,29 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 # warning at startup, rather than silently falling back to an embedded key.
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
 DATA_GOV_API_KEY    = os.getenv("DATA_GOV_API_KEY", "")
 DEBUG_MODE          = os.getenv("FLASK_DEBUG", "0") == "1"
+
+# Gemini is used as a genuinely INDEPENDENT second vision model in the crop
+# diagnosis ensemble. Only active when GEMINI_API_KEY is set in .env — without
+# it the ensemble simply runs the Groq vision passes as before.
+GEMINI_DIAGNOSIS_MODEL = os.getenv("GEMINI_DIAGNOSIS_MODEL", "gemini-3.1-flash-lite")
+
+# ── Optional heavy deps: Sentinel-2 NDVI (live satellite vegetation) ─────
+# rasterio + numpy are only needed for the REAL Sentinel-2 vegetation-health
+# feature. On systems where they aren't installed the app still runs fully —
+# the /api/ndvi endpoint transparently falls back to a clearly-labelled
+# seasonal estimate instead of breaking.
+try:
+    import numpy as np                       # noqa: F401  (kept for rasterio COG math)
+    import rasterio
+    from rasterio.transform import rowcol
+    from rasterio.warp import transform as _rasterio_warp
+    _RASTERIO_AVAILABLE = True
+except ImportError:
+    _RASTERIO_AVAILABLE = False
+    print("[AgroSmart] rasterio/numpy not installed — NDVI will use estimation fallback")
 
 # ── Diagnosis QA logging ─────────────────────────────────────────────────
 # Every diagnosis (image + full model output, from every ensemble pass) is
@@ -83,6 +104,8 @@ LANG_NAMES = {
 # those features simply won't work until .env is filled in.
 print(f"[AgroSmart] Groq key:      {'OK' if GROQ_API_KEY else 'MISSING — set GROQ_API_KEY in .env'}")
 print(f"[AgroSmart] Weather key:   {'OK' if OPENWEATHER_API_KEY else 'MISSING — set OPENWEATHER_API_KEY in .env'}")
+print(f"[AgroSmart] Gemini key:   {'OK' if GEMINI_API_KEY else 'unset — diagnosis uses Groq only'}")
+print(f"[AgroSmart] NDVI:         {'ENABLED (live Sentinel-2 via rasterio)' if _RASTERIO_AVAILABLE else 'ESTIMATE-ONLY (install rasterio+numpy for live Sentinel-2 NDVI)'}")
 print(f"[AgroSmart] data.gov.in key: {'OK' if DATA_GOV_API_KEY else 'MISSING — set DATA_GOV_API_KEY in .env (get a free key at https://data.gov.in). Market data will use the offline fallback until then.'}")
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -105,6 +128,160 @@ def alerts():
 @app.route('/offline')
 def offline():
     return render_template('offline.html')
+
+# ─── Satellite Vegetation Health — Sentinel-2 NDVI ───────────────────────────
+# Real NDVI via free Element84 "Earth Search" STAC catalog + direct COG pixel
+# reads from Sentinel-2 L2A imagery (ESA/Copernicus). When rasterio isn't
+# installed, or no cloud-free recent scene covers the point, the endpoint
+# falls back to a clearly-labelled seasonal estimate so the UI never breaks.
+_ndvi_cache = {}
+_NDVI_CACHE_TTL = 6 * 3600   # seconds — a fresh Sentinel-2 scene only arrives ~daily
+_ndvi_lock = threading.Lock()
+
+
+def _ndvi_status(ndvi):
+    """Map an NDVI value to a plain-language vegetation status label."""
+    if ndvi is None:
+        return "Unavailable"
+    if ndvi < 0.0:
+        return "Water / Cloud / No Data"
+    if ndvi < 0.1:
+        return "Bare Soil / Urban / Rock"
+    if ndvi < 0.2:
+        return "Sparse Vegetation / Bare Soil"
+    if ndvi < 0.4:
+        return "Moderate Vegetation"
+    if ndvi < 0.6:
+        return "Good Vegetation Cover"
+    return "Dense / Healthy Vegetation"
+
+
+def estimate_ndvi(lat, lon):
+    """Deterministic seasonal-typical NDVI estimate. Used ONLY when live
+    Sentinel-2 data cannot be fetched (rasterio missing, STAC unreachable,
+    no recent cloud-free scene). Always clearly tagged source='estimate' —
+    it is a farming-season heuristic, never presented as live satellite data."""
+    month = datetime.now().month
+    if month in (6, 7, 8, 9):          # Kharif monsoon — peak biomass
+        seasonal_base = 0.82
+    elif month in (10, 11, 12, 1, 2):  # Rabi winter — good cover
+        seasonal_base = 0.70
+    else:                              # Zaid summer — lower cover
+        seasonal_base = 0.55
+    seed = int(hashlib.md5(f"{round(lat,2)}|{round(lon,2)}|{month}".encode('utf-8')).hexdigest(), 16)
+    ndvi = max(0.10, min(0.90, seasonal_base + ((seed % 100) / 100.0 - 0.5) * 0.12))
+    return {
+        "ndvi":      round(ndvi, 3),
+        "status":    _ndvi_status(ndvi),
+        "obs_date":  None,
+        "cloud_pct": None,
+        "source":    "estimate",
+        "lat":       round(lat, 4),
+        "lon":       round(lon, 4),
+    }
+
+
+def get_sentinel2_ndvi(lat, lon):
+    """Fetch a REAL NDVI value at (lat, lon) from Sentinel-2 L2A imagery.
+    Returns a dict {ndvi, status, obs_date, cloud_pct, source} or None when
+    the real-data pipeline can't resolve a value (caller falls back)."""
+    if not _RASTERIO_AVAILABLE:
+        return None
+    cache_key = f"{round(lat, 2)},{round(lon, 2)}"  # ~1 km grid cell
+    now = time.time()
+    with _ndvi_lock:
+        cached = _ndvi_cache.get(cache_key)
+        if cached and (now - cached["ts"]) < _NDVI_CACHE_TTL:
+            return cached["data"]
+
+    try:
+        # 1) Find the most recent cloud-free-enough Sentinel-2 L2A scene.
+        stac_resp = requests.post(
+            "https://earth-search.aws.element84.com/v1/search",
+            json={
+                "collections": ["sentinel-2-l2a"],
+                "query": {"eo:cloud_cover": {"lt": 40}},
+                "intersects": {"type": "Point", "coordinates": [float(lon), float(lat)]},
+                "sortby": [{"field": "properties.datetime", "direction": "desc"}],
+                "limit": 3,
+            },
+            timeout=20,
+        )
+        if stac_resp.status_code != 200:
+            print(f"[NDVI] STAC HTTP {stac_resp.status_code} — using estimate")
+            return None
+        features = (stac_resp.json().get("features") or [])
+        if not features:
+            print("[NDVI] No Sentinel-2 scenes found for point — using estimate")
+            return None
+        feat      = features[0]
+        props     = feat.get("properties") or {}
+        obs_date  = (props.get("datetime") or "")[:10]
+        cloud_pct = props.get("eo:cloud_cover")
+        epsg      = props.get("proj:epsg")
+        assets    = feat.get("assets") or {}
+        red_asset = assets.get("red") or assets.get("B04")
+        nir_asset = assets.get("nir") or assets.get("B08")
+        if not (epsg and red_asset and nir_asset):
+            return None
+
+        # 2) Transform the lon/lat point into the scene's CRS and read the
+        #    1-pixel window from each COG (NIR & Red) directly over HTTPS.
+        src_x, src_y = _rasterio_warp("EPSG:4326", f"EPSG:{epsg}", [float(lon)], [float(lat)])
+        red_val = nir_val = None
+        with rasterio.Env():
+            with rasterio.open(red_asset["href"]) as ds:
+                row, col = rowcol(ds.transform, src_x[0], src_y[0])
+                if 0 <= row < ds.height and 0 <= col < ds.width:
+                    red_val = float(ds.read(1, window=((row, row + 1), (col, col + 1)))[0][0])
+            with rasterio.open(nir_asset["href"]) as ds2:
+                row, col = rowcol(ds2.transform, src_x[0], src_y[0])
+                if 0 <= row < ds2.height and 0 <= col < ds2.width:
+                    nir_val = float(ds2.read(1, window=((row, row + 1), (col, col + 1)))[0][0])
+        if red_val is None or nir_val is None or (nir_val + red_val) == 0:
+            print(f"[NDVI] Sensor value issue (red={red_val}, nir={nir_val}) — using estimate")
+            return None
+
+        ndvi = round(max(-1.0, min(1.0, (nir_val - red_val) / (nir_val + red_val))), 3)
+        result = {
+            "ndvi":      ndvi,
+            "status":    _ndvi_status(ndvi),
+            "obs_date":  obs_date,
+            "cloud_pct": cloud_pct,
+            "source":    "Sentinel-2 L2A",
+            "lat":       round(lat, 4),
+            "lon":       round(lon, 4),
+        }
+        with _ndvi_lock:
+            _ndvi_cache[cache_key] = {"ts": now, "data": result}
+        print(f"[NDVI] Sentinel-2 OK: NDVI={ndvi}, status='{result['status']}'")
+        return result
+    except Exception as e:
+        print(f"[NDVI] error: {e} — using estimate")
+        return None
+
+
+@app.route("/api/ndvi")
+def get_ndvi():
+    """Vegetation health for a location. Returns LIVE Sentinel-2 NDVI when
+    the real-data pipeline succeeds, with a clearly-tagged seasonal estimate
+    as fallback. The `source` field tells the UI which one the farmer sees."""
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    if not lat or not lon:
+        return jsonify({"error": "Location required"}), 400
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid coordinates"}), 400
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return jsonify({"error": "Invalid coordinates"}), 400
+
+    result = get_sentinel2_ndvi(lat, lon)
+    if result is None:
+        result = estimate_ndvi(lat, lon)
+    return jsonify(result)
+
 
 # ─── Weather API ─────────────────────────────────────────────────────────────
 @app.route("/api/weather")
@@ -1164,6 +1341,44 @@ def _run_vision_pass(image_b64, prompt, sys_prompt, model, temperature):
     return json.loads(match.group())
 
 
+def _run_gemini_pass(image_b64, prompt, sys_prompt):
+    """Run one diagnosis pass against Google's Gemini API and return the
+    parsed JSON, or None on any failure. When GEMINI_API_KEY is configured
+    this gives the ensemble a genuinely INDEPENDENT second model (different
+    vendor, different weights) instead of re-running the same Groq vision
+    model at a second temperature — so an agreement between Groq & Gemini
+    is real cross-model evidence, which is exactly what the QA log wants."""
+    if not GEMINI_API_KEY:
+        return None
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_DIAGNOSIS_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    body = {
+        "system_instruction": {"parts": [{"text": sys_prompt}]},
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+                {"text": prompt},
+            ],
+        }],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1200},
+    }
+    try:
+        resp = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=45)
+        if resp.status_code != 200:
+            print(f"[Diagnose] Gemini HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+        raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            return None
+        return json.loads(match.group())
+    except Exception as e:
+        print(f"[Diagnose] Gemini exception: {e}")
+        return None
+
+
 def _diseases_agree(name_a, name_b):
     """Fuzzy-match two disease name strings so small phrasing differences
     between passes ('Late Blight' vs 'Late blight disease') still count as
@@ -1411,16 +1626,24 @@ Respond ONLY with valid JSON, no markdown or backticks:
         (i, vision_models[i % len(vision_models)], pass_temperatures[i % len(pass_temperatures)])
         for i in range(ENSEMBLE_PASSES)
     ]
-    pass_outcomes = [None] * ENSEMBLE_PASSES  # preserve original pass order in results
+    # When a Gemini key is configured, append a genuinely INDEPENDENT second
+    # model to the ensemble. The "gemini" token here is a dispatch marker;
+    # the real model id is recorded in `models_used` so the QA log and the
+    # review tool show exactly which models actually ran.
+    if GEMINI_API_KEY:
+        pass_plan.append((len(pass_plan), "gemini", 0.3))
+    pass_outcomes = [None] * len(pass_plan)  # preserve original pass order in results
 
     def _run_pass(i, model, temp):
         try:
+            if model == "gemini":
+                return _run_gemini_pass(image_b64, prompt, sys_prompt)
             return _run_vision_pass(image_b64, prompt, sys_prompt, model, temp)
         except Exception as e:
             print(f"[Diagnose] pass {i} ({model}) failed: {e}")
             return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=ENSEMBLE_PASSES) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(pass_plan)) as executor:
         future_to_pass = {
             executor.submit(_run_pass, i, model, temp): (i, model)
             for i, model, temp in pass_plan
@@ -1432,11 +1655,12 @@ Respond ONLY with valid JSON, no markdown or backticks:
                 pass_outcomes[i] = (parsed, model)
 
     results, models_used = [], []
+    gemini_display = f"gemini:{GEMINI_DIAGNOSIS_MODEL}"
     for outcome in pass_outcomes:
         if outcome is not None:
             parsed, model = outcome
             results.append(parsed)
-            models_used.append(model)
+            models_used.append(gemini_display if model == "gemini" else model)
 
     if not results:
         return jsonify({"error": "All vision models failed. Check your GROQ_API_KEY in .env"}), 500
@@ -1469,6 +1693,7 @@ Respond ONLY with valid JSON, no markdown or backticks:
     primary["_lang"] = lang
     primary["model_agreement"] = agreement
     primary["_passes_run"] = len(results)
+    primary["_models_used"] = models_used   # e.g. ["qwen/qwen3.6-27b", "gemini:gemini-3.1-flash-lite"]
     if alternate_diagnosis:
         primary["alternate_diagnosis"] = alternate_diagnosis
 
@@ -1664,6 +1889,229 @@ def get_alerts():
         alerts.append({"type":"info","category":"Crop Advisory","icon":"🌾","title":"Crops at Risk in Current Conditions","message":f"Avoid growing: {', '.join(harmful)}","action":"Consider alternate crops better suited to current climate."})
 
     return jsonify({"alerts": alerts, "total": len(alerts)})
+
+# ─── Multi-period Alert Tiers (#2) ───────────────────────────────────────────
+# /api/alerts above only covers the CURRENT instant. These endpoints extend
+# it to the 6-day forecast, a 30-day monthly outlook, city+season advisories
+# and a per-crop risk % with a best-harvest window. They reuse the exact same
+# rule engine as /api/alerts (as a pure function) so every tier stays
+# consistent with the "now" view.
+
+def _rule_alerts(temp, humidity, wind_speed, rain, description=""):
+    """The /api/alerts rule engine as a pure per-day function, so the
+    forecast / monthly / seasonal tiers can evaluate any future day
+    identically to the current conditions a farmer sees today."""
+    description = (description or "").lower()
+    alerts = []
+    if temp > 40:
+        alerts.append({"type":"danger","category":"Weather","icon":"🌡️","title":"Extreme Heat Alert","message":"Temperature above 40°C. Provide shade netting and increase irrigation frequency.","action":"Schedule irrigation more often. Avoid afternoon spraying."})
+    if temp < 5:
+        alerts.append({"type":"danger","category":"Weather","icon":"❄️","title":"Frost Warning","message":"Sub-zero temperatures could damage standing crops overnight.","action":"Cover crops with frost cloth. Use sprinkler irrigation if available."})
+    if humidity > 85:
+        alerts.append({"type":"warning","category":"Disease","icon":"🍄","title":"High Fungal Disease Risk","message":"Humidity above 85% creates ideal conditions for fungal diseases.","action":"Apply preventive fungicide (Mancozeb 75 WP at 2.5 g/L)."})
+    if wind_speed > 50:
+        alerts.append({"type":"danger","category":"Weather","icon":"💨","title":"High Wind Speed Alert","message":"Strong winds can cause lodging in tall crops like maize and wheat.","action":"Avoid spraying. Support tall crops with stakes."})
+    if rain > 50:
+        alerts.append({"type":"warning","category":"Weather","icon":"🌧️","title":"Heavy Rainfall Alert","message":"Excessive rain may cause waterlogging and root rot.","action":"Open field drainage channels. Pause irrigation."})
+    if "storm" in description or "thunder" in description:
+        alerts.append({"type":"danger","category":"Weather","icon":"⛈️","title":"Thunderstorm Warning","message":"Thunderstorm conditions detected. Risk of lightning and hail.","action":"Stay indoors. Secure farm equipment."})
+    if 25 <= temp <= 35 and humidity > 70:
+        alerts.append({"type":"warning","category":"Pest","icon":"🐛","title":"Aphid & Whitefly Risk","message":"Warm humid conditions favour aphid multiplication.","action":"Spray Neem oil (5 ml/L) or Imidacloprid 0.3 ml/L at dusk."})
+    if temp > 30 and humidity < 50:
+        alerts.append({"type":"warning","category":"Pest","icon":"🕷️","title":"Spider Mite Alert","message":"Hot dry conditions favour rapid spider mite growth.","action":"Apply Abamectin 1.8 EC (0.5 ml/L). Increase soil moisture."})
+    harmful = []
+    if temp > 38:   harmful.append("Wheat (grain shriveling risk)")
+    if humidity > 85 and rain > 20: harmful.append("Cotton (boll rot risk)")
+    if temp < 10:   harmful.append("Rice (cold injury risk)")
+    if harmful:
+        alerts.append({"type":"info","category":"Crop Advisory","icon":"🌾","title":"Crops at Risk","message":"Avoid growing: " + ", ".join(harmful),"action":"Consider more climate-appropriate crops."})
+    return alerts
+
+@app.route("/api/alerts-forecast", methods=["POST"])
+def alerts_forecast():
+    """Day-by-day forecast alerts + a per-day risk score (0-100) over the
+    next week, reusing the same rule engine as /api/alerts."""
+    data = request.json or {}
+    forecast = data.get("forecast") or []
+    items = []
+    for day in forecast[:7]:
+        t = float(day.get("temp_max", 25))
+        h = float(day.get("humidity", 60))
+        w = float(day.get("wind_speed", 10))
+        r = float(day.get("rain", 0))
+        als = _rule_alerts(t, h, w, r, day.get("description", ""))
+        risk = min(100, len(als) * 12 + (10 if t > 40 else 0) + (8 if h > 85 else 0))
+        items.append({
+            "date":        day.get("date"),
+            "temp_max":    round(t, 1),
+            "temp_min":    round(float(day.get("temp_min", t)), 1),
+            "humidity":    round(h, 1),
+            "rain":        round(r, 1),
+            "description": day.get("description", ""),
+            "alerts":      als,
+            "risk":        risk,
+        })
+    if not items:
+        return jsonify({"forecast": [], "risk_level": "unknown"})
+    risks = [i["risk"] for i in items]
+    avg = sum(risks) / len(risks)
+    risk_level = "high" if avg >= 50 else ("moderate" if avg >= 25 else "low")
+    worst = max(items, key=lambda x: x["risk"])
+    best = min(items, key=lambda x: x["risk"])
+    return jsonify({
+        "forecast":   items,
+        "risk_level": risk_level,
+        "avg_risk":   round(avg, 1),
+        "worst_day":  worst["date"],
+        "worst_risk": worst["risk"],
+        "best_day":   best["date"],
+    })
+
+def _monthly_advisory_text(season, week):
+    """Short season-aware weekly advisory for the 30-day outlook."""
+    if "Kharif" in season:
+        plan = {1: "Prepare fields & monitor early sowing of monsoon crops.",
+                2: "Watch for early fungal outbreaks; keep drainage open.",
+                3: "Top-dress nitrogen; scout for stem borer / fall armyworm.",
+                4: "Prepare for harvest; reduce irrigation if rain persists."}
+    elif "Zaid" in season:
+        plan = {1: "Plan short-duration summer crops; maximise irrigation.",
+                2: "Mulch to hold soil moisture through dry heat.",
+                3: "Watch mites & thrips in hot dry conditions.",
+                4: "Harvest early-maturing vegetables before peak heat."}
+    else:
+        plan = {1: "Sow Rabi wheat/mustard; ensure good field moisture.",
+                2: "Continue irrigation; watch aphids and yellow rust.",
+                3: "Apply second top-dressing; monitor frost risk.",
+                4: "Stop irrigation before harvest; prepare for threshing."}
+    return plan.get(week, plan.get(1))
+
+
+@app.route("/api/monthly-alerts", methods=["POST"])
+def monthly_alerts():
+    """30-day long-term outlook split into 4 weekly buckets."""
+    data = request.json or {}
+    season = data.get("season") or get_season(datetime.now().month)
+    forecast = data.get("forecast") or []
+    weekly = []
+    for w in range(1, 5):
+        slice_days = forecast[(w - 1) * 7:(w - 1) * 7 + 7]
+        if slice_days:
+            t = sum(float(d.get("temp_max", 25)) for d in slice_days) / len(slice_days)
+            h = sum(float(d.get("humidity", 60)) for d in slice_days) / len(slice_days)
+            rain = sum(float(d.get("rain", 0)) for d in slice_days)
+        else:  # beyond the 7-day window — season-typical projection
+            t, h, rain = ((30.0, 78.0, 18.0) if "Kharif" in season
+                          else (34.0, 50.0, 3.0) if "Zaid" in season
+                          else (27.0, 62.0, 8.0))
+        weekly.append({
+            "week":          w,
+            "label":         f"Week {w}",
+            "temp":          round(t, 1),
+            "humidity":      round(h, 1),
+            "rain_estimate": round(rain, 1),
+            "alerts":        _rule_alerts(t, h, 10, rain, ""),
+            "advisory":      _monthly_advisory_text(season, w),
+        })
+    return jsonify({"season": season, "weeks": weekly})
+
+def _seasonal_advisories(season, city):
+    """Season-aware farming advisory cards suitable for the given city."""
+    if "Kharif" in season:
+        recs = [
+            {"category": "Crop Advisory", "icon": "🌱", "title": "Sowing Window",
+             "message": f"Monsoon (Jun-Sep) is prime for paddy, maize, cotton & soybean in {city or 'your area'}.",
+             "action": "Sow after the first substantial rains; use water-tolerant varieties."},
+            {"category": "Irrigation", "icon": "💧", "title": "Avoid Waterlogging",
+             "message": "Excess monsoon rain risks root rot in sensitive crops.",
+             "action": "Keep field channels clear; stop irrigation when rain is heavy."},
+            {"category": "Pest", "icon": "🐛", "title": "Scout New Growth",
+             "message": "Humid conditions invite stem borer, fall armyworm & leaf folder.",
+             "action": "Walk fields weekly; act at the first sign of damage."},
+            {"category": "Disease", "icon": "🍄", "title": "Fungal Watch",
+             "message": "High humidity favours blast, blight & leaf spot.",
+             "action": "Apply preventive fungicide during cloudy spells."},
+        ]
+    elif "Zaid" in season:
+        recs = [
+            {"category": "Crop Advisory", "icon": "🌿", "title": "Short-Duration Crops",
+             "message": "Summer (Mar-May) suits short-duration vegetables, chilies & melons.",
+             "action": "Choose heat-tolerant, early-maturing varieties."},
+            {"category": "Irrigation", "icon": "💧", "title": "Maintain Soil Moisture",
+             "message": "Dry heat stresses crops quickly.",
+             "action": "Irrigate early morning/evening; mulch to retain moisture."},
+            {"category": "Pest", "icon": "🕷️", "title": "Heat-Pest Watch",
+             "message": "Hot dry spells trigger spider mites & thrips.",
+             "action": "Increase soil moisture; spray safe acaricides if colonies appear."},
+        ]
+    else:
+        recs = [
+            {"category": "Crop Advisory", "icon": "🌾", "title": "Rabi Sowing",
+             "message": "Winter (Oct-Feb) suits wheat, mustard, chickpea & potato in most belts.",
+             "action": "Sow at the right depth; keep field moisture uniform."},
+            {"category": "Irrigation", "icon": "💧", "title": "Cold-Wave Protection",
+             "message": "Light frost can stress young Rabi crops.",
+             "action": "Protect tender fields on cold nights; irrigate lightly before frost."},
+            {"category": "Pest", "icon": "🐛", "title": "Aphid & Rust Watch",
+             "message": "Cool moist weather favours aphids & yellow rust.",
+             "action": "Scout regularly; apply fungicide at the first sign of rust."},
+            {"category": "Harvest", "icon": "🌾", "title": "Harvest Planning",
+             "message": "Plan harvest as crops mature to catch the best prices.",
+             "action": "Check maturity; stop irrigation 10-14 days before harvest."},
+        ]
+    return recs
+
+
+@app.route("/api/seasonal-alerts", methods=["POST"])
+def seasonal_alerts():
+    """Seasonal farming advisories by city."""
+    data = request.json or {}
+    city = data.get("city", "")
+    season = data.get("season") or get_season(datetime.now().month)
+    return jsonify({"city": city, "season": season, "advisories": _seasonal_advisories(season, city)})
+
+
+@app.route("/api/crop-risk", methods=["POST"])
+def crop_risk():
+    """Per-crop weather risk % over the 6-day forecast + best harvest window,
+    using each crop's real temperature band from the recommendation table."""
+    data = request.json or {}
+    forecast = data.get("forecast") or []
+    crops = data.get("crops") or []
+    season = data.get("season") or get_season(datetime.now().month)
+    band = {c["name"]: c for c in recommend_crops(25, 60, 5, season)}
+    default = (18, 32)
+    results = []
+    for c in crops[:12]:
+        name = (c.get("name") if isinstance(c, dict) else c) or ""
+        ref = band.get(name, {})
+        tmin, tmax = ref.get("temp_range") or default
+        days = []
+        for day in forecast[:6]:
+            t = float(day.get("temp_max", 25))
+            h = float(day.get("humidity", 60))
+            r = float(day.get("rain", 0))
+            score = 100
+            if t < tmin: score -= int((tmin - t) * 4)
+            if t > tmax: score -= int((t - tmax) * 4)
+            if h > 85:   score -= 12
+            if r > 40:   score -= 10
+            days.append(max(0, min(100, score)))
+        score_avg = round(sum(days) / len(days), 1) if days else None
+        # `days` are suitability scores (higher = safer); expose genuine RISK %
+        # (higher = riskier) so the UI reads intuitively.
+        risk = round(100 - (score_avg or 0), 1)
+        level = ("high" if risk >= 55 else ("moderate" if risk >= 30 else "low"))
+        best = None
+        for day in forecast[:6]:
+            t = float(day.get("temp_max", 25))
+            tm = float(day.get("temp_min", t))
+            if (tmin - 2) <= tm and t <= (tmax + 2):
+                best = day.get("date")
+                break
+        results.append({"name": name, "risk": risk, "score": score_avg, "level": level, "best_window": best, "days": days})
+    results.sort(key=lambda x: x["risk"] or 0)   # safest first
+    return jsonify({"season": season, "crops": results})
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 TRANSLATE_MODELS = [

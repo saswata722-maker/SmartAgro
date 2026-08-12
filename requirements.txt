@@ -2,3 +2,7 @@ flask==3.0.3
 requests==2.31.0
 python-dotenv==1.0.1
 gunicorn==21.2.0
+# Optional: only needed for LIVE Sentinel-2 NDVI (satellite vegetation health).
+# Without these the app still runs — /api/ndvi falls back to a labelled estimate.
+rasterio>=1.3.9
+numpy>=1.26.0
