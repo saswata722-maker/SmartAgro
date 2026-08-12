@@ -255,6 +255,9 @@ async function loadAlertsData(lat, lon) {
             if (el) el.style.display = '';
         });
 
+        // Advisory outlook (multi-period alerts #2)
+        loadOutlook(currentWeather, weatherData.forecast || []);
+
         // Apply saved language translation immediately if non-English
         const savedLang = localStorage.getItem('agrosmart_lang') || 'en';
         if (savedLang !== 'en') {
@@ -804,3 +807,125 @@ document.addEventListener('DOMContentLoaded', () => {
   const firstTab = document.querySelector('.alert-tab');
   if (firstTab) firstTab.classList.add('active');
 });
+
+/* ══════════════════════════════════════════════
+   ADVISORY OUTLOOK (multi-period alerts #2)
+══════════════════════════════════════════════ */
+function _ohPane(id) { return document.getElementById(id); }
+
+function seasonNow() {
+    const m = new Date().getMonth() + 1;
+    if (m >= 6 && m <= 9) return 'Kharif (Monsoon)';
+    if (m >= 10 || m <= 2) return 'Rabi (Winter)';
+    return 'Zaid (Summer)';
+}
+function _ohErr(label) {
+    return `<div style="text-align:center;padding:30px;color:var(--text-3)"><i class="fas fa-cloud" style="font-size:1.6rem;margin-bottom:8px;display:block;color:var(--amber)"></i>Could not load ${label} outlook.</div>`;
+}
+
+async function loadOutlook(current, forecast) {
+    const section = document.getElementById('outlookSection');
+    if (!section) return;
+    section.style.display = '';
+    const season = seasonNow();
+    const city = (current && current.city) || '';
+
+    try {
+        const res = await fetch('/api/alerts-forecast', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ forecast }) });
+        renderForecastOutlook(await res.json());
+    } catch (e) { const p = _ohPane('outlookForecast'); if (p) p.innerHTML = _ohErr('6-day'); }
+
+    try {
+        const res = await fetch('/api/monthly-alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ forecast, season }) });
+        renderMonthlyOutlook(await res.json());
+    } catch (e) { const p = _ohPane('outlookMonthly'); if (p) p.innerHTML = _ohErr('monthly'); }
+
+    try {
+        const res = await fetch('/api/seasonal-alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ city, season }) });
+        renderSeasonalOutlook(await res.json());
+    } catch (e) { const p = _ohPane('outlookSeasonal'); if (p) p.innerHTML = _ohErr('seasonal'); }
+
+    try {
+        const res = await fetch('/api/crop-risk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+            forecast, season,
+            crops: ['Wheat','Rice','Maize','Cotton','Tomato','Soybean','Mustard','Potato','Onion','Chilli','Groundnut','Sugarcane']
+        }) });
+        renderCropRiskOutlook(await res.json());
+    } catch (e) { const p = _ohPane('outlookCropRisk'); if (p) p.innerHTML = _ohErr('crop risk'); }
+}
+
+function switchHorizon(h) {
+    document.querySelectorAll('.outlook-tab').forEach(t => t.classList.remove('active'));
+    const btn = document.querySelector(`.outlook-tab[data-horizon="${h}"]`);
+    if (btn) btn.classList.add('active');
+    const map = { forecast: 'outlookForecast', monthly: 'outlookMonthly', seasonal: 'outlookSeasonal', croprisk: 'outlookCropRisk' };
+    Object.entries(map).forEach(([key, id]) => {
+        const el = _ohPane(id);
+        if (el) el.style.display = (key === h) ? '' : 'none';
+    });
+}
+
+function renderForecastOutlook(data) {
+    const el = _ohPane('outlookForecast');
+    if (!el) return;
+    if (!data || !data.forecast || !data.forecast.length) { el.innerHTML = _ohErr('6-day'); return; }
+    el.innerHTML = data.forecast.map(d => {
+        const cls = d.risk >= 50 ? 'high' : d.risk >= 25 ? 'moderate' : 'low';
+        return `<div class="oh-day">
+          <div class="oh-day-head">
+            <span class="oh-date">${d.date}</span>
+            <span style="font-size:0.78rem;color:var(--text-3)">${d.temp_min}° / ${d.temp_max}°C · RH ${d.humidity}%</span>
+            <span class="oh-risk ${cls}">Risk ${d.risk}%</span>
+          </div>
+          <div class="oh-alerts">
+            ${d.alerts.length ? d.alerts.map(a => `<div class="oh-alert">${a.icon} <b>${a.title}</b> — ${a.message}</div>`).join('') : '<div class="oh-alert" style="color:var(--green)">✓ No major alerts this day</div>'}
+          </div>
+        </div>`;
+    }).join('');
+}
+
+function renderMonthlyOutlook(data) {
+    const el = _ohPane('outlookMonthly');
+    if (!el) return;
+    if (!data || !data.weeks) { el.innerHTML = _ohErr('monthly'); return; }
+    el.innerHTML = data.weeks.map(w => `
+      <div class="oh-week">
+        <div class="oh-week-title"><span>${w.label} · 30-day outlook</span><span style="font-size:0.75rem;color:var(--text-3)">~${w.temp}°C / RH ${w.humidity}%</span></div>
+        <div class="oh-advisory"><i class="fas fa-bullhorn" style="color:var(--amber);margin-right:6px"></i>${w.advisory}</div>
+        <div class="oh-alerts" style="margin-top:8px">
+          ${w.alerts.length ? w.alerts.map(a => `<div class="oh-alert">${a.icon} ${a.title}</div>`).join('') : '<div class="oh-alert" style="color:var(--green)">✓ Clear week</div>'}
+        </div>
+      </div>`).join('');
+}
+
+function renderSeasonalOutlook(data) {
+    const el = _ohPane('outlookSeasonal');
+    if (!el) return;
+    if (!data || !data.advisories) { el.innerHTML = _ohErr('seasonal'); return; }
+    el.innerHTML = `<div style="margin-bottom:12px;font-size:0.86rem;color:var(--text-2)"><i class="fas fa-seedling" style="color:var(--green);margin-right:6px"></i>${data.season}${data.city ? ' · ' + data.city : ''}</div>
+      <div class="oh-recs">${data.advisories.map(a => `
+        <div class="oh-rec">
+          <div class="oh-rec-title">${a.icon} ${a.title}</div>
+          <div class="oh-rec-msg">${a.message}</div>
+          <div class="oh-rec-action"><i class="fas fa-arrow-right"></i> ${a.action}</div>
+        </div>`).join('')}</div>`;
+}
+
+function renderCropRiskOutlook(data) {
+    const el = _ohPane('outlookCropRisk');
+    if (!el) return;
+    if (!data || !data.crops) { el.innerHTML = _ohErr('crop risk'); return; }
+    el.innerHTML = `<div style="margin-bottom:12px;font-size:0.86rem;color:var(--text-2)">6-day weather risk for top crops · <b>higher % = riskier to grow now</b></div>
+      <div style="overflow-x:auto"><table class="cr-table">
+        <thead><tr><th>Crop</th><th style="width:34%">Risk</th><th>Level</th><th>Best window</th></tr></thead>
+        <tbody>${data.crops.map(c => {
+            const pct = c.risk == null ? 0 : Math.max(0, Math.min(100, c.risk));
+            const color = c.risk >= 55 ? 'var(--red)' : c.risk >= 30 ? 'var(--amber)' : 'var(--green)';
+            return `<tr>
+              <td>🌾 ${c.name}</td>
+              <td><div class="cr-bar"><div style="width:${pct}%;background:${color}"></div></div></td>
+              <td style="color:${color};font-weight:700">${c.level}</td>
+              <td>${c.best_window || '—'}</td>
+            </tr>`;
+        }).join('')}</tbody></table></div>`;
+}
