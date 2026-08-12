@@ -194,6 +194,8 @@ document.addEventListener('DOMContentLoaded', () => {
 ══════════════════════════════════════════════ */
 async function loadAllMarkets() {
     try {
+        // Skeleton loader while the (slow, multi-state) market fetch runs (#9)
+        showSkeleton('marketCitiesGrid', 4, 'market');
         const res = await fetch('/api/market');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
