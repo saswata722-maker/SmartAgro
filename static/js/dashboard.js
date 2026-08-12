@@ -283,13 +283,83 @@ function requestLocation() {
 /* ── Load weather then crops ────────────────── */
 async function loadWeatherAndCrops(lat, lon) {
     showHeroLoading();
+    // Skeleton loaders so the page feels responsive while the AI runs (#9)
+    showSkeleton('cropsGrid', 3, 'crop');
+    showSkeleton('calendarTimeline', 2, 'calendar');
     const data = await fetchWeather(lat, lon);
     if (!data) return;
 
     renderHeroCard(data.current);
     renderWeatherSection(data.current, data.forecast);
     renderStatBar(data.current);
+    loadNdvi(lat, lon);            // satellite vegetation health (#1)
     loadCropRecommendations(data.current);
+}
+
+/* ── Satellite Vegetation Health (NDVI) ────── */
+let ndviMap = null;
+
+async function loadNdvi(lat, lon) {
+    const section = document.getElementById('ndviSection');
+    if (!section) return;
+    try {
+        const res = await fetch(`/api/ndvi?lat=${lat}&lon=${lon}`);
+        const data = await res.json();
+        if (!res.ok || data.error || data.ndvi == null) {
+            section.style.display = 'none';
+            return;
+        }
+        renderNdvi(data, lat, lon);
+    } catch (e) {
+        console.error('NDVI error:', e);
+        section.style.display = 'none';
+    }
+}
+
+function renderNdvi(data, lat, lon) {
+    const section = document.getElementById('ndviSection');
+    if (section) section.style.display = '';
+
+    const frac = Math.max(0, Math.min(1, (data.ndvi + 1) / 2));
+    const arc = document.getElementById('ndviArc');
+    if (arc) arc.style.strokeDashoffset = String(251.3 * (1 - frac));
+    const val = document.getElementById('ndviVal');
+    if (val) val.textContent = data.ndvi.toFixed(2);
+
+    const color = data.ndvi < 0.2 ? 'var(--red)'
+        : data.ndvi < 0.4 ? 'var(--amber)'
+        : data.ndvi < 0.6 ? '#38bdf8' : 'var(--green)';
+    const status = document.getElementById('ndviStatus');
+    if (status) {
+        status.innerHTML = `<i class="fas fa-leaf" style="color:${color}"></i> ${data.status}`;
+        status.style.color = color;
+    }
+    const meta = document.getElementById('ndviMeta');
+    if (meta) {
+        meta.innerHTML = data.obs_date
+            ? `<span><i class="fas fa-calendar-day"></i> Observed ${data.obs_date}</span>`
+            : `<span><i class="fas fa-calendar-day"></i> Seasonal basis</span>`;
+    }
+    const src = document.getElementById('ndviSource');
+    if (src) {
+        src.innerHTML = data.source === 'Sentinel-2 L2A'
+            ? `<span class="badge-live"><i class="fas fa-satellite"></i> Live Sentinel-2</span>`
+            : `<span class="badge-estimate"><i class="fas fa-calculator"></i> Estimated (no recent cloud-free satellite scene)</span>`;
+    }
+    initNdviMap(lat, lon);
+}
+
+function initNdviMap(lat, lon) {
+    const el = document.getElementById('ndviMap');
+    if (!el || typeof L === 'undefined') return;
+    if (ndviMap) { ndviMap.remove(); ndviMap = null; }
+    ndviMap = L.map(el, { zoomControl: true }).setView([lat, lon], 13);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 19,
+        attribution: 'Esri World Imagery'
+    }).addTo(ndviMap);
+    L.marker([lat, lon]).addTo(ndviMap)
+        .bindPopup(`Location<br/><b>${lat.toFixed(4)}, ${lon.toFixed(4)}</b>`).openPopup();
 }
 
 /* ── Hero weather card ──────────────────────── */
