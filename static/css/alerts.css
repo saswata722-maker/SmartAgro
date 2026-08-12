@@ -354,6 +354,34 @@
   }
   .alerts-hero { padding-bottom: 40px; }
   .location-section { padding-top: 40px; }
+
+/* ── Advisory Outlook (multi-period alerts #2) ── */
+.outlook-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0; }
+.outlook-tab { padding: 9px 18px; border-radius: 999px; background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2); font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: var(--trans); }
+.outlook-tab.active { background: var(--green-dark); border-color: var(--green); color: #fff; box-shadow: 0 0 14px var(--green-glow); }
+.outlook-pane { animation: fadeInUp 0.3s ease; }
+.oh-day { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
+.oh-day-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.oh-date { font-weight: 700; font-size: 0.9rem; }
+.oh-risk { font-size: 0.72rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+.oh-risk.high     { background: rgba(239,68,68,0.15); color: var(--red); }
+.oh-risk.moderate { background: rgba(251,191,36,0.15); color: var(--amber); }
+.oh-risk.low      { background: rgba(34,197,94,0.15); color: var(--green); }
+.oh-alerts { display: flex; flex-direction: column; gap: 6px; }
+.oh-alert { font-size: 0.8rem; color: var(--text-2); }
+.oh-week { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
+.oh-week-title { font-weight: 700; display: flex; justify-content: space-between; }
+.oh-advisory { font-size: 0.82rem; color: var(--text-2); margin-top: 6px; }
+.oh-recs { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.oh-rec { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.oh-rec-title { font-weight: 700; font-size: 0.85rem; margin-bottom: 4px; }
+.oh-rec-msg { font-size: 0.78rem; color: var(--text-2); }
+.oh-rec-action { font-size: 0.75rem; color: var(--green); margin-top: 6px; }
+.cr-table { width: 100%; border-collapse: collapse; }
+.cr-table th, .cr-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+.cr-bar { height: 8px; border-radius: 4px; background: var(--bg-2); overflow: hidden; min-width: 120px; }
+.cr-bar > div { height: 100%; border-radius: 4px; }
+
   .risk-chart-layout { grid-template-columns: 1fr; }
   .page-hero h1 { font-size: clamp(1.8rem, 5vw, 2.8rem); }
   .summary-card { padding: 14px 16px; gap: 10px; }
