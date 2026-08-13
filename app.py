@@ -1105,6 +1105,168 @@ def _is_rate_limited(ip: str) -> bool:
     return False
 
 
+# ─── Chatbot topic gate (#chat-limits) ──────────────────────────────────────
+# Kisan Helper is intentionally narrow-scoped: only agriculture / SmartAgro.
+# These helpers keep random chit-chat (jokes, general knowledge, coding help,
+# …) out WITHOUT burning a billed Groq call or wasting the model's context.
+
+# Strong on-topic signals. If ANY appears in a message we skip the classifier
+# entirely — this saves latency and tokens on the flood of genuine farmer
+# questions every day. Covers English + the most common Indian languages.
+_CHAT_ON_TOPIC_WORDS = [
+    "crop", "crops", "farming", "farmer", "farm", "soil", "seed", "seeds",
+    "fertiliser", "fertilizer", "pesticide", "insecticide", "fungicide", "herbicide",
+    "irrigation", "irrigate", "rain", "rainfall", "weather", "temperature", "humidity",
+    "market", "mandi", "price", "prices", "yield", "harvest", "harvesting", "sowing",
+    "plant", "plants", "leaf", "leaves", "disease", "diseases", "pest", "pests",
+    "insect", "insects", "bug", "bugs", "weed", "weeds", "field", "fields",
+    "paddy", "rice", "wheat", "maize", "corn", "cotton", "sugarcane",
+    "groundnut", "peanut", "soybean", "soyabean", "sunflower", "mustard", "onion",
+    "potato", "tomato", "chilli", "chili", "ginger", "turmeric", "garlic",
+    "neem", "compost", "manure", "urea", "drip", "sprinkler", "drainage",
+    "monsoon", "rabi", "kharif", "zaid", "germination", "sapling", "transplant",
+    "maturity", "ripening", "pm-kisan", "pmkisan", "scheme", "subsidy", "loan",
+    "insurance", "kcc", "organic", "biofertilizer", "biopesticide",
+    "फसल", "खेती", "किसान", "मिट्टी", "बीज", "उर्वरक", "कीटनाशक", "सिंचाई", "बारिश",
+    "मौसम", "तापमान", "आर्द्रता", "बाजार", "भाव", "उपज", "कटाई", "बोना", "पौधा",
+    "पत्ता", "रोग", "कीट", "धान", "गेहूँ", "मक्का", "कपास", "गन्ना", "मूँगफली",
+    "सरसों", "प्याज", "आलू", "टमाटर", "मिर्च", "अदरक", "हल्दी", "लहसन", "नीम",
+    "खाद", "यूरिया", "ड्रिप", "मानसून", "सरकार", "योजना",
+    "ਖੇਤੀ", "ਫਸਲ", "किसान", "ખેતી", "ફસલ", "शेती", "సాగుదిద్ది", "விவசாய்",
+    "பயிர்", "ಕೃಷಿ", "ಬೆಳೆ", "কৃষি", "ফসল", "বাংলা",
+    "agriculture", "agri", "horticulture", "mulch", "tillage", "plough", "tractor",
+    "thresher", "pruning", "grafting", "nursery", "greenhouse", "polyhouse", "orchard",
+    "plantation", "seedling", "variety", "hybrid", "nutrient", "nitrogen", "phosphorus",
+    "potassium", "micronutrient", "zinc", "boron", "vermicompost", "pheromone", "blight",
+    "rust", "wilt", "mildew", "nematode", "mango", "banana", "pomegranate", "guava",
+    "papaya", "coconut", "cashew", "rubber", "tea", "coffee", "cardamom", "pepper",
+    "chickpea", "gram", "lentil", "pulse", "pulses", "barley", "oats", "millet",
+    "bajra", "jowar", "ragi", "sorghum", "sesame", "til", "castor", "jute",
+    "drought", "waterlogging", "frost", "hail", "sunlight", "intercropping",
+    "crop rotation", "cover crop", "green manure", "raised bed", "furrow", "bund",
+    "terrace", "deficiency", "chlorosis", "necrosis", "trichoderma", "rhizobium",
+    "azotobacter", "biocontrol", "ladybug", "spray", "curl", "yellowing", "photosynthesis",
+]
+_CHAT_OFF_TOPIC_WORDS = [
+    "movie", "movies", "cricket", "football", "song", "songs", "joke", "jokes",
+    "celebrity", "actor", "actress", "politics", "stock", "stocks", "crypto",
+    "bitcoin", "software", "coding", "programming", "resume", "job", "jobs",
+    # Same junk in Indian scripts, so the fast-path works without a classifier
+    # call regardless of the user's language.
+    "सिनेमा", "फिल्म", "मज़ाक", "मजाक", "क्रिकट", "फुटबॉल", "गाना", "गीत",
+    "कोडिंग", "प्रोग्रामिंग", "नर्तक", "अभिनय", "राजनीति",
+    "recipe", "recipes", "cooking", "cook", "kitchen", "restaurant", "travel", "tour",
+    "tourism", "holiday", "vacation", "instagram", "facebook", "whatsapp", "youtube", "tiktok",
+    "reels", "gaming", "gamer", "playstation", "xbox", "computer", "laptop", "mobile",
+    "smartphone", "internet", "website", "technology", "science", "physics", "chemistry",
+    "maths", "mathematics", "history", "geography", "news", "fashion", "clothes", "shopping",
+    "makeup", "fitness", "gym", "doctor", "hospital", "medicine", "car", "bike", "vehicle",
+    "electricity", "engineering", "law", "court", "lawyer", "hockey", "tennis", "badminton",
+    "kabaddi", "chess", "olympics", "ipl", "film", "cinema", "serial", "drama", "music",
+    "dance", "singing", "art", "painting", "drawing", "poem", "poetry", "story", "novel",
+    "book", "literature", "philosophy", "horoscope", "astrology", "astronomy", "space",
+    "rocket", "university", "college", "school", "exam", "homework", "salary", "voting",
+    "election", "crime", "police", "love", "relationship", "marriage", "birthday",
+    "celebration", "party",
+    "खाना", "रेसिपी", "यात्रा", "खेल", "गेम", "पढ़ाई", "दवा", "बीमारी", "प्रेम", "शादी", "पार्टी",
+    "debug", "code", "codes", "python", "javascript", "html", "css", "github",
+    "capital", "country", "population", "president", "moon", "planet", "universe", "galaxy",
+]
+
+
+def _compile_word_matchers(words):
+    """Split a keyword list into (a) Latin words matched as WHOLE words with an
+    optional English plural -(e)s, and (b) Indian-script words matched as plain
+    substrings (so plurals like किसानों still carry the stem किसान). Whole-word
+    matching stops substring collisions such as 'debug' being treated as the
+    crop keyword 'bug', or 'program' as the crop 'gram'."""
+    latin = [w for w in words if w.isascii()]
+    scripts = tuple(w for w in words if not w.isascii())
+    rx = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in latin) + r")(?:s|es)?\b", re.IGNORECASE)
+    return rx, scripts
+
+
+_CHAT_ON_TOPIC_RX, _CHAT_ON_TOPIC_RAW = _compile_word_matchers(_CHAT_ON_TOPIC_WORDS)
+_CHAT_OFF_TOPIC_RX, _CHAT_OFF_TOPIC_RAW = _compile_word_matchers(_CHAT_OFF_TOPIC_WORDS)
+
+
+def _chat_message_on_topic(text: str) -> bool:
+    """Decide whether `text` is plausibly an agriculture/SmartAgro question.
+    Fast keyword fast-path; falls back to a tiny Groq classifier. FAIL-OPEN."""
+    if not text:
+        return True
+    low = text.lower()
+    # 1) clear agricultural keyword present -> on topic, no classifier needed
+    if _CHAT_ON_TOPIC_RX.search(low):
+        return True
+    if any(w in low for w in _CHAT_ON_TOPIC_RAW):
+        return True
+    # 2) clear off-topic keyword present (and no agri signal) -> off topic,
+    #    no classifier needed. This blocks obvious junk/cheerio prompts
+    #    without a network round-trip.
+    if _CHAT_OFF_TOPIC_RX.search(low):
+        return False
+    if any(w in low for w in _CHAT_OFF_TOPIC_RAW):
+        return False
+    # 3) generic/ambiguous message -> cheap throwaway classifier pass
+    if not GROQ_API_KEY:
+        return True  # fail open
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": "llama-3.1-8b-instant",          # cheap + fast
+        "messages": [
+            {"role": "user", "content": (
+                "You are a strict content filter for Kisan Helper, a farming-only chatbot for Indian farmers. "
+                "Classify whether the message is about FARMING/AGRICULTURE or the SmartAgro app: crop diseases & pests, "
+                "soil, weather for crops, irrigation, seeds, fertilizers/pesticides, market/mandi prices, or government "
+                "farm schemes/subsidies (PM-KISAN, KCC, crop insurance). "
+                "If it is about one of those, output {\"on_topic\": true}. "
+                "If it is about anything else — general knowledge, news, movies, sports, jokes, coding, math, science, "
+                "recipes, travel, greetings/chit-chat, or personal/health advice — output {\"on_topic\": false}. "
+                "Examples: \"my wheat leaves are yellow\" → {\"on_topic\": true}; \"what is the capital of France\" → {\"on_topic\": false}; "
+                "\"tell me a joke\" → {\"on_topic\": false}; \"hello how are you\" → {\"on_topic\": false}. "
+                "Reply with ONLY the JSON object, nothing else.\n\nMessage: " + text[:400]
+            )}
+        ],
+        "temperature": 0,
+        "max_tokens": 32,
+    }
+    try:
+        resp = requests.post(GROQ_CHAT_URL, headers=headers, json=body, timeout=8)
+        if resp.status_code != 200:
+            return True  # fail open
+        parsed = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        parsed = re.sub(r"```(?:json)?", "", parsed).replace("```", "").strip()
+        m = re.search(r"\{.*\}", parsed, re.DOTALL)
+        obj = json.loads(m.group() if m else parsed)
+        return bool(obj.get("on_topic", True))
+    except Exception:
+        return True  # fail open — never block a real farmer question
+
+
+# Pre-canned polite refusals (localized) for the off-topic case, so we don't
+# pay for a model call to generate a redirect. Covers the major Indian
+# languages; falls back to English.
+_OFF_TOPIC_REPLIES = {
+    "en":  "🌾 I'm Kisan Helper — I only know about farming! Ask me about crops, pests, soil, weather, market prices, or schemes like PM-KISAN, and I'll help. ",
+    "hi":  "🌾 मैं Kisan Helper हूँ — मुझे सिर्फ खेती के बारे में पता चलता है! फसल, कीट, मिट्टी, मौसम, बाजार भाव या सरकारी योजनाओं के बारे में पूछिए। ",
+    "bn":  "🌾 আমি Kisan Helper — আমি স্বল্প জানি কৃষি সম্পর্কে! ফসল, কীট, মাটি, আবহাওয়া, বাজার দাম বা সরকারি ষ্ট্যাম্প সম্পর্কে জিজ্ঞাসা করুন। ",
+    "pa":  "🌾 ਮੈਂ Kisan Helper ਹਾਂ — ਮੈਂ ਸਿਰਫ਼ ਖੇਤੀਬਾੜੀ ਬਾਰੇ ਜਾਣਦਾ ਹਾਂ! ਫਸਲ, ਕੀੜੇ, ਮਿੱਟੀ, ਮੌਸਮ ਜਾਂ ਸਰਕਾਰੀ ਯੋਜਨਾਵਾਂ ਬਾਰੇ ਪੁੱਛੋ। ",
+    "gu":  "🌾 હું Kisan Helper છું — હું માત્ર ખેતી વિશે જાણું છું! પંક્જન, કીટ, માટી, હવામાન કે સરકારી યોજનાઓ વિશે પૂછો. ",
+    "mr":  "🌾 मी Kisan Helper आहे — मला फक्त शेतीवरून माहिती आहे! पीळ, कीड, माती, हवामान किंवा सरकारी योजना विषयी विचारा. ",
+    "ta":  "🌾 நான் Kisan Helper — வயவியில் மேல்ல தெரிவிகை! பயிர், நுண்ணின்பை, மண், வானிலை அல்லது அரசுக் கொள்கைகள் பற்றி கேளுங்கள். ",
+    "te":  "🌾 నేను Kisan Helper — నాణ్యమైన వ్యవసాయం మాత్రమే! పంటలు, నిత్యకూలి, నేల, వాతావరణం లేదా ప్రభుత్వ యోజనల గురించి అడగండి. ",
+    "ml":  "🌾 ഞാൻ Kisan Helper — കർഷണം സംബന്ധിച്ചതുൾപ്പറമ്മേ! ചെറ്റം, പീഡി, മണ്ണ് അല്ലെങ്കിൽ സർക്കാർ പദ്ധതി എന്നിവ ചോദിക്കുക. ",
+    "kn":  "🌾 ನಾನು Kisan Helper — ರೈವಸಾಯಿಕೆ ಸಂಬಂಧಿಸಿದೆಯೇ! ಬೆಳಿ, ಕೇಂದ್ರ, ನೊಂತಳ್ಳಿ, ಹವಾಮನ ಅಥವಾ ಸರ್ಕಾರಿ ಯೋಜನೆಗಳ ಬಗ್ಗೆ ಕೇಳಿ. ",
+    "or":  "🌾 ମୁଁ Kisan Helper — କୃଷି ବିଷୟରୁ ଜାଣାକର୍ତ୍ତା! ଫସଲ, କୀଟ, ମାଟି, ମୌସମ କିମ୍ବା ସରକାରୀ ଯୋଜନା ରେ ପ୍ରଶ୍ନ କରନ୍ତୁ। ",
+    "as":  "🌾 মই Kisan Helper — মৌলো কৃষি সম্পৰ্কে জাণো! ফসল, কীট, মাটি, আবহাওয়া অথবা সৰকাৰী যোজনাৰ বিষয়ে উত্থান কৰিও। ",
+    "sa":  "🌾 अहं Kisan Helper अस्मि — कृषिविषये एव सहाययाम्! फसलं, कीटः, माटि:, मौसमः इत्यादी पृष्टु। ",
+}
+
+def _off_topic_reply(lang: str) -> str:
+    return _OFF_TOPIC_REPLIES.get(lang, _OFF_TOPIC_REPLIES["en"])
+
+
 @app.route("/api/chat", methods=["POST"])
 def kisan_chat():
     if not GROQ_API_KEY:
@@ -1122,6 +1284,22 @@ def kisan_chat():
         return jsonify({"error": "No messages"}), 400
 
     lang_name = LANG_NAMES.get(lang, "English")
+
+    # ── Topic gate (#chat-limits) ───────────────────────────
+    # Kisan Helper ONLY answers agriculture / SmartAgro questions. Before we
+    # ever pay for a Groq call, cheaply classify the latest user message:
+    #   1. Fast-path: if it contains strong agricultural keywords (in English
+    #      or any of India's major languages) it's obviously on-topic → skip
+    #      the classifier and proceed. This avoids a network call on every
+    #      genuine farmer question.
+    #   2. Otherwise run a tiny throwaway classifier pass (temp 0, max_tokens 32)
+    #      that returns {"on_topic": true/false}.
+    #   3. If anything fails, we FAIL OPEN (treat as on-topic) — a network
+    #      hiccup must never block a real farmer's disease/pest question.
+    last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+    if last_user and not _chat_message_on_topic(last_user):
+        return jsonify({"reply": _off_topic_reply(lang), "off_topic": True})
+
     context_data = data.get("context", {})
     
     context_str = ""
@@ -1141,12 +1319,15 @@ def kisan_chat():
             if crop_names:
                 context_str += f"\n- Recommended Crops for them: {', '.join(crop_names)}"
 
-    system_prompt = f"""You are Kisan Helper, a friendly AI agricultural assistant for Indian farmers built into SmartAgro app.
-The user may write to you in ANY language or mix of languages — Hindi, English, Bengali, Tamil, or any other.
-No matter what language the user writes in, you MUST always reply ONLY in {lang_name}, using its native script (not transliteration).
-You help farmers with: crop diseases, weather advice, pesticide usage, market prices, government schemes, soil health, irrigation.
-Keep answers practical, simple, and farmer-friendly. Use bullet points for lists.
-Always be warm and address the farmer respectfully. Never use markdown headers. Keep responses under 200 words."""
+    system_prompt = f"""You are Kisan Helper, a highly specialized AI assistant built ONLY for Indian farmers inside the SmartAgro app. You are NOT a general-purpose chatbot.
+
+HARD RULE — TOPIC LIMIT: You ONLY answer questions about farming, agriculture, and the SmartAgro app. Allowed topics: crop diseases & pests, weather/location advice for crops, pesticide/fertilizer/compost usage, market & mandi prices, government farm schemes & subsidies (PM-KISAN, KCC, crop insurance), soil health, irrigation, and sowing/harvest timing.
+
+STRICT REFUSAL: If the user asks about ANYTHING outside farming and the SmartAgro app — general knowledge, news, movies, sports, music, fashion, jokes, coding, math, science, history, recipes, travel, personal or health advice, gossip, or any other unrelated chit-chat — you MUST NOT answer it, even partially, even if the user insists or repeats the request. Instead, politely refuse and redirect them with wording like: "I'm Kisan Helper — I only help with farming and the SmartAgro app. Ask me about crops, pests, soil, weather, market prices, or schemes like PM-KISAN." Reply in {lang_name}.
+
+LANGUAGE: The user may write in any language; always reply ONLY in {lang_name}, in its native script (not transliteration).
+
+STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. No markdown headers, no fluff. Under 200 words. If unsure, say so and suggest consulting a local farm expert."""
 
     if context_str:
         system_prompt += f"\n\nContext about the user's current situation (use this if they ask about weather, location, or what to grow):{context_str}"
@@ -1425,97 +1606,6 @@ def _log_diagnosis(record):
         print(f"[DiagnosisLog] Could not write log entry: {e}")
 
 
-# ── Diagnosis dedup cache: same photo re-submitted? ────────────────────
-# A farmer retrying — or the UI re-sending the exact same photo after a
-# hiccup — used to re-pay the FULL pipeline every time: pre-classifier
-# call, both ensemble passes, image re-save and a new log line, from
-# scratch. Identical bytes are identified exactly by their SHA-256 (a
-# large margin over the 12-char short hash already embedded in image
-# filenames), so a cheap lookup short-circuits all of that and replays the
-# stored diagnosis. Language is part of the key: re-submitting the SAME
-# photo in a different language still runs a fresh (correctly worded)
-# diagnosis instead of replaying a wrong-language answer.
-DIAGNOSIS_CACHE_TTL_SEC     = int(os.getenv("DIAGNOSIS_CACHE_TTL_SEC", str(7 * 24 * 3600)))  # 7 days, override-able via .env
-DIAGNOSIS_CACHE_MAX_ENTRIES = 500
-DIAGNOSIS_LOG_TAIL_BYTES    = 1 * 1024 * 1024  # restart-persistence scan only reads the newest ~1MB of the log
-
-_diagnosis_dedup_cache = {}       # f"{sha256}|{lang}" -> {"id", "ts", "response"}
-_diagnosis_dedup_lock  = threading.Lock()
-
-
-def _diagnosis_cache_key(image_sha256, lang):
-    return f"{image_sha256}|{lang}"
-
-
-def _store_cached_diagnosis(cache_key, record):
-    """Remember a fresh diagnosis so an identical resubmission within the
-    TTL window short-circuits instead of re-paying the whole pipeline."""
-    with _diagnosis_dedup_lock:
-        _diagnosis_dedup_cache[cache_key] = record
-        if len(_diagnosis_dedup_cache) > DIAGNOSIS_CACHE_MAX_ENTRIES:
-            now = time.time()
-            for k in [k for k, v in _diagnosis_dedup_cache.items()
-                      if now - v["ts"] >= DIAGNOSIS_CACHE_TTL_SEC]:
-                _diagnosis_dedup_cache.pop(k, None)   # drop expired entries first
-            while len(_diagnosis_dedup_cache) > DIAGNOSIS_CACHE_MAX_ENTRIES:
-                _diagnosis_dedup_cache.pop(next(iter(_diagnosis_dedup_cache)))  # then oldest
-
-
-def _find_cached_diagnosis(cache_key):
-    """Return a stored diagnosis record for identical image bytes+lang, or
-    None. Fast path is the in-memory dict (zero I/O). On a miss we scan
-    only the TAIL of the JSONL audit log (newest entries) so a cache that
-    was seeded before a process restart still short-circuits correctly —
-    bounded to DIAGNOSIS_LOG_TAIL_BYTES instead of an ever-growing O(whole
-    log) read. Records that can't qualify are skipped: cache-hit audit
-    entries, other languages, and pre-dedup entries that lack an image
-    hash entirely."""
-    now = time.time()
-    image_sha, lang = cache_key.split("|", 1)
-    with _diagnosis_dedup_lock:
-        hit = _diagnosis_dedup_cache.get(cache_key)
-        if hit:
-            if (now - hit["ts"]) < DIAGNOSIS_CACHE_TTL_SEC:
-                return hit
-            _diagnosis_dedup_cache.pop(cache_key, None)
-
-    try:
-        size = os.path.getsize(DIAGNOSIS_LOG_PATH)
-        if size > DIAGNOSIS_LOG_TAIL_BYTES:
-            with open(DIAGNOSIS_LOG_PATH, "rb") as f:
-                f.seek(size - DIAGNOSIS_LOG_TAIL_BYTES)
-                f.readline()  # drop the partial first line at the cut boundary
-                chunk = f.read().decode("utf-8", errors="replace")
-        else:
-            with open(DIAGNOSIS_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                chunk = f.read()
-    except (FileNotFoundError, OSError):
-        return None
-
-    for line in reversed(chunk.splitlines()):   # newest record first
-        if not line.strip():
-            continue
-        try:
-            rec = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            continue
-        if rec.get("cached") or rec.get("lang") != lang or rec.get("image_sha256") != image_sha:
-            continue
-        if not rec.get("response"):
-            continue
-        try:
-            ts = datetime.fromisoformat(rec["timestamp"]).timestamp()
-        except (KeyError, TypeError, ValueError):
-            continue
-        if (now - ts) >= DIAGNOSIS_CACHE_TTL_SEC:
-            return None   # newest match is already stale — nothing older can be fresher
-        found = {"id": rec["id"], "ts": ts, "response": rec["response"]}
-        with _diagnosis_dedup_lock:
-            _diagnosis_dedup_cache[cache_key] = found
-        return found
-    return None
-
-
 @app.route("/api/diagnose", methods=["POST"])
 def diagnose_crop():
     if not GROQ_API_KEY:
@@ -1534,41 +1624,18 @@ def diagnose_crop():
     if len(image_b64) > MAX_IMAGE_B64_LEN:
         return jsonify({"error": "Image too large. Please use an image under 1 MB."}), 413
 
-    # ── Step 1: dedup — has this EXACT image+language been diagnosed ─────
-    # recently? Re-submitting the same photo (UI retry, double-tap, farmer
-    # re-trying) used to re-pay for the pre-classifier, both ensemble
-    # passes, an image re-save and a fresh log line every single time. The
-    # SHA-256 of the decoded bytes identifies identical photos exactly, so
-    # a cheap lookup short-circuits all of that and replays the stored
-    # diagnosis. Language is part of the key so a same-photo request in
-    # another language still gets a freshly-worded answer. Non-crop
-    # rejections are deliberately NOT cached (that 422 short-circuits
-    # before this point) so the cheap classifier re-checks each time.
+    # ── Step 1: decode + validate the image ──────────────────────────────
+    # NOTE: intentionally NO dedup / short-circuit here. A farmer re-submitting
+    # the same photo (UI retry, double-tap, retrying from a flaky network)
+    # always re-runs the full pipeline so they get a fresh, live diagnosis
+    # instead of a stale replay. The image SHA-256 below is kept only as an
+    # audit identifier for the QA log / saved image filename — it never skips
+    # a real diagnosis.
     try:
         image_raw = base64.b64decode(image_b64)
     except Exception:
         return jsonify({"error": "Image data is not valid base64"}), 400
     image_sha256 = hashlib.sha256(image_raw).hexdigest()
-    cache_key = _diagnosis_cache_key(image_sha256, lang)
-
-    cached = _find_cached_diagnosis(cache_key)
-    if cached:
-        response = dict(cached["response"])
-        response["cached"]      = True
-        response["cached_from"] = cached["id"]
-        # Lightweight audit entry so the QA log still shows the re-request
-        # happened — without re-saving the image or running any model call.
-        _log_diagnosis({
-            "id":           f"{int(time.time()*1000)}_{ip.replace('.', '-').replace(':', '-')}",
-            "timestamp":    datetime.now().isoformat(),
-            "ip":           ip,
-            "lang":         lang,
-            "image_sha256": image_sha256,
-            "cached":       True,
-            "cached_from":  cached["id"],
-        })
-        print(f"[Diagnose] cache hit ({lang}) for image {image_sha256[:12]} — reused record {cached['id']}")
-        return jsonify(response)
 
     # ── Step 2: cheap pre-classifier — reject non-crop photos early ─────
     is_plant, reject_reason = ai_is_crop_image(image_b64)
@@ -1698,9 +1765,11 @@ Respond ONLY with valid JSON, no markdown or backticks:
         primary["alternate_diagnosis"] = alternate_diagnosis
 
     # ── Step 5: log image + full result for human spot-checking ─────────
-    # The record now also stores the image's full SHA-256 and the exact
-    # response payload — both are what make a later identical re-submission
-    # resolvable as a cache hit (and keep the QA log fully replayable).
+    # The audit entry stores the image's full SHA-256, the exact response
+    # payload, and every pass's raw output, so a human reviewer can compare
+    # the model's answer against the real photo. Each re-submission of the
+    # same image creates a fresh entry (no dedup) — re-runs always reflect
+    # the live model, never a stale replay.
     record_id = f"{int(time.time()*1000)}_{ip.replace('.', '-').replace(':', '-')}"
     image_filename = _save_diagnosis_image(image_b64, record_id)
     _log_diagnosis({
@@ -1718,17 +1787,9 @@ Respond ONLY with valid JSON, no markdown or backticks:
         "severity":             primary.get("severity"),
         "image_file":           image_filename,
         "raw_results":          results,   # every pass' full untouched output
-        "response":             primary,   # exact JSON the API returned (replay source for dedup)
+        "response":             primary,   # exact JSON the API returned (audit/QA replay)
         "human_reviewed":       False,     # a reviewer can flip this after checking the image
         "human_verdict":        None,      # "correct" | "incorrect" | "uncertain"
-    })
-
-    # Seed the dedup cache so an identical resubmission within the TTL
-    # window short-circuits without even touching the log file.
-    _store_cached_diagnosis(cache_key, {
-        "id":       record_id,
-        "ts":       time.time(),
-        "response": primary,
     })
 
     return jsonify(primary)
