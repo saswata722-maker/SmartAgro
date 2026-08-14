@@ -1,5 +1,7 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, g
 import requests
+import logging
+import uuid
 
 # ── Windows fix: force IPv4 for outbound requests ───────────────────────────
 # If a browser reaches a URL instantly but Python's `requests` times out on
@@ -36,6 +38,31 @@ app = Flask(__name__)
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
+# ── Structured logging ───────────────────────────────────────────────────────
+# All logs go through Python's `logging` (instead of bare print) so they carry a
+# timestamp, a severity level, and a per-request ID for tracing. Set LOG_LEVEL in
+# .env to change verbosity (INFO default). API keys are never logged.
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("smartagro")
+
+
+@app.before_request
+def _request_start():
+    g._start = time.monotonic()
+    g.request_id = uuid.uuid4().hex[:10]
+
+
+@app.after_request
+def _log_request(response):
+    dur_ms = (time.monotonic() - g.get("_start", time.monotonic())) * 1000
+    logger.info("%s %s -> %s (%.0fms) rid=%s",
+                request.method, request.path, response.status_code, dur_ms, g.get("request_id", "-"))
+    return response
+
 # ── API keys / secrets — ALWAYS from environment (.env), never hardcoded ────
 # Every value below comes exclusively from os.getenv(). None of them has a
 # real credential baked in as a fallback default: if a variable is missing
@@ -65,7 +92,7 @@ try:
     _RASTERIO_AVAILABLE = True
 except ImportError:
     _RASTERIO_AVAILABLE = False
-    print("[AgroSmart] rasterio/numpy not installed — NDVI will use estimation fallback")
+    logger.warning("[AgroSmart] rasterio/numpy not installed — NDVI will use estimation fallback")
 
 # ── Diagnosis QA logging ─────────────────────────────────────────────────
 # Every diagnosis (image + full model output, from every ensemble pass) is
@@ -78,6 +105,12 @@ DIAGNOSIS_IMAGES_DIR = os.path.join(DIAGNOSIS_LOG_DIR, "images")
 DIAGNOSIS_LOG_PATH   = os.path.join(DIAGNOSIS_LOG_DIR, "log.jsonl")
 os.makedirs(DIAGNOSIS_IMAGES_DIR, exist_ok=True)
 _diagnosis_log_lock = threading.Lock()
+if os.getenv("SPACE_ID"):
+    logger.warning(
+        "On Hugging Face Spaces the diagnosis QA logs/images (%s) are EPHEMERAL "
+        "and are wiped on every redeploy. Set DIAGNOSIS_LOG_DIR to a mounted "
+        "volume if the accuracy audit trail matters.", DIAGNOSIS_LOG_DIR,
+    )
 
 # Number of independent diagnosis passes to run and cross-check per image.
 # If `vision_models` (defined near the /api/diagnose route below) only has
@@ -102,11 +135,11 @@ LANG_NAMES = {
 # actual key values. Missing DATA_GOV_API_KEY is non-fatal (data.gov.in
 # allows limited public access), but Groq/Weather being missing means
 # those features simply won't work until .env is filled in.
-print(f"[AgroSmart] Groq key:      {'OK' if GROQ_API_KEY else 'MISSING — set GROQ_API_KEY in .env'}")
-print(f"[AgroSmart] Weather key:   {'OK' if OPENWEATHER_API_KEY else 'MISSING — set OPENWEATHER_API_KEY in .env'}")
-print(f"[AgroSmart] Gemini key:   {'OK' if GEMINI_API_KEY else 'unset — diagnosis uses Groq only'}")
-print(f"[AgroSmart] NDVI:         {'ENABLED (live Sentinel-2 via rasterio)' if _RASTERIO_AVAILABLE else 'ESTIMATE-ONLY (install rasterio+numpy for live Sentinel-2 NDVI)'}")
-print(f"[AgroSmart] data.gov.in key: {'OK' if DATA_GOV_API_KEY else 'MISSING — set DATA_GOV_API_KEY in .env (get a free key at https://data.gov.in). Market data will use the offline fallback until then.'}")
+logger.info(f"[AgroSmart] Groq key:      {'OK' if GROQ_API_KEY else 'MISSING — set GROQ_API_KEY in .env'}")
+logger.info(f"[AgroSmart] Weather key:   {'OK' if OPENWEATHER_API_KEY else 'MISSING — set OPENWEATHER_API_KEY in .env'}")
+logger.info(f"[AgroSmart] Gemini key:   {'OK' if GEMINI_API_KEY else 'unset — diagnosis uses Groq only'}")
+logger.info(f"[AgroSmart] NDVI:         {'ENABLED (live Sentinel-2 via rasterio)' if _RASTERIO_AVAILABLE else 'ESTIMATE-ONLY (install rasterio+numpy for live Sentinel-2 NDVI)'}")
+logger.info(f"[AgroSmart] data.gov.in key: {'OK' if DATA_GOV_API_KEY else 'MISSING — set DATA_GOV_API_KEY in .env (get a free key at https://data.gov.in). Market data will use the offline fallback until then.'}")
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -128,6 +161,26 @@ def alerts():
 @app.route('/offline')
 def offline():
     return render_template('offline.html')
+
+
+@app.route('/healthz')
+def healthz():
+    """Liveness probe for load balancers / uptime checks. No secrets."""
+    return jsonify({"status": "ok"})
+
+
+@app.route('/readyz')
+def readyz():
+    """Readiness probe: reports whether each optional feature is configured,
+    WITHOUT exposing any actual key value."""
+    return jsonify({
+        "status": "ok",
+        "groq_configured":      bool(GROQ_API_KEY),
+        "weather_configured":   bool(OPENWEATHER_API_KEY),
+        "gemini_configured":    bool(GEMINI_API_KEY),
+        "market_configured":    bool(DATA_GOV_API_KEY),
+        "ndvi_live":            _RASTERIO_AVAILABLE,
+    })
 
 # ─── Satellite Vegetation Health — Sentinel-2 NDVI ───────────────────────────
 # Real NDVI via free Element84 "Earth Search" STAC catalog + direct COG pixel
@@ -208,11 +261,11 @@ def get_sentinel2_ndvi(lat, lon):
             timeout=20,
         )
         if stac_resp.status_code != 200:
-            print(f"[NDVI] STAC HTTP {stac_resp.status_code} — using estimate")
+            logger.warning(f"[NDVI] STAC HTTP {stac_resp.status_code} — using estimate")
             return None
         features = (stac_resp.json().get("features") or [])
         if not features:
-            print("[NDVI] No Sentinel-2 scenes found for point — using estimate")
+            logger.warning("[NDVI] No Sentinel-2 scenes found for point — using estimate")
             return None
         feat      = features[0]
         props     = feat.get("properties") or {}
@@ -239,7 +292,7 @@ def get_sentinel2_ndvi(lat, lon):
                 if 0 <= row < ds2.height and 0 <= col < ds2.width:
                     nir_val = float(ds2.read(1, window=((row, row + 1), (col, col + 1)))[0][0])
         if red_val is None or nir_val is None or (nir_val + red_val) == 0:
-            print(f"[NDVI] Sensor value issue (red={red_val}, nir={nir_val}) — using estimate")
+            logger.warning(f"[NDVI] Sensor value issue (red={red_val}, nir={nir_val}) — using estimate")
             return None
 
         ndvi = round(max(-1.0, min(1.0, (nir_val - red_val) / (nir_val + red_val))), 3)
@@ -254,10 +307,10 @@ def get_sentinel2_ndvi(lat, lon):
         }
         with _ndvi_lock:
             _ndvi_cache[cache_key] = {"ts": now, "data": result}
-        print(f"[NDVI] Sentinel-2 OK: NDVI={ndvi}, status='{result['status']}'")
+        logger.info(f"[NDVI] Sentinel-2 OK: NDVI={ndvi}, status='{result['status']}'")
         return result
     except Exception as e:
-        print(f"[NDVI] error: {e} — using estimate")
+        logger.warning(f"[NDVI] error: {e} — using estimate")
         return None
 
 
@@ -307,7 +360,7 @@ def get_weather():
         if current_resp.status_code != 200:
             return jsonify({"error": f"Weather API error: {current_resp.text}"}), 500
         if forecast_resp.status_code != 200:
-            print(f"[Weather] Forecast API error: {forecast_resp.text}")
+            logger.warning(f"[Weather] Forecast API error: {forecast_resp.text}")
 
         current_data  = current_resp.json()
         forecast_data = forecast_resp.json()
@@ -353,7 +406,7 @@ def get_weather():
             "forecast": forecast_list
         })
     except Exception as e:
-        print(f"[Weather error] {e}")
+        logger.warning(f"[Weather error] {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -423,7 +476,7 @@ exactly this shape:
     try:
         resp = _post_to_groq(body, headers)
         if resp is None or resp.status_code != 200:
-            print(f"[CropAI] Groq HTTP {getattr(resp, 'status_code', 'no-response')} for {city}")
+            logger.warning(f"[CropAI] Groq HTTP {getattr(resp, 'status_code', 'no-response')} for {city}")
             return None
         raw = resp.json()["choices"][0]["message"]["content"].strip()
         cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -435,10 +488,10 @@ exactly this shape:
         for c in crops:
             c.setdefault("icon", "🌱")
         _crop_ai_cache[cache_key] = (now, crops)
-        print(f"[CropAI] OK for {city}: {len(crops)} crops")
+        logger.info(f"[CropAI] OK for {city}: {len(crops)} crops")
         return crops
     except Exception as e:
-        print(f"[CropAI] error for {city}: {e}")
+        logger.warning(f"[CropAI] error for {city}: {e}")
         return None
 
 
@@ -635,7 +688,7 @@ def get_pesticide_guide(crops):
 # the app runs on the offline/dynamic MSP-reference fallback below instead
 # of ever falling back to any embedded key.
 if not DATA_GOV_API_KEY:
-    print("[AgroSmart] DATA_GOV_API_KEY not set — market prices will use the offline "
+    logger.warning("[AgroSmart] DATA_GOV_API_KEY not set — market prices will use the offline "
           "MSP-reference fallback. Get a free personal key at https://data.gov.in")
 
 AGMARKNET_RESOURCE_ID = "9ef84268-d588-465a-a308-a864a43d0070"
@@ -777,11 +830,18 @@ def _load_history_cache():
 
 
 def _save_history_cache(cache):
+    # Write ATOMICALLY (temp file + rename) so a crash mid-write can never leave
+    # a truncated/corrupt price-history cache. The read-modify-write cycle is
+    # already guarded by _agmark_history_lock at the call site.
+    tmp_path = _AGMARK_HISTORY_PATH + ".tmp"
     try:
-        with open(_AGMARK_HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _AGMARK_HISTORY_PATH)
     except Exception as e:
-        print(f"[Market] Could not persist history cache: {e}")
+        logger.warning(f"[Market] Could not persist history cache: {e}")
 
 
 def _field(record: dict, *keys):
@@ -825,27 +885,27 @@ def _fetch_state_commodities_raw(state: str) -> dict:
         try:
             resp = _agmark_session.get(AGMARKNET_URL, params=params, timeout=15)
             if resp.status_code != 200:
-                print(f"[Market] Agmarknet HTTP {resp.status_code} for state='{candidate}': {resp.text[:200]}")
+                logger.warning(f"[Market] Agmarknet HTTP {resp.status_code} for state='{candidate}': {resp.text[:200]}")
                 continue
             body = resp.json()
             records = body.get("records", [])
             if records:
-                print(f"[Market] Agmarknet: {len(records)} raw records for state='{candidate}' "
+                logger.info(f"[Market] Agmarknet: {len(records)} raw records for state='{candidate}' "
                       f"(total available: {body.get('total', '?')})")
                 break
             else:
-                print(f"[Market] Agmarknet: 0 records for state='{candidate}' — trying next candidate if any")
+                logger.warning(f"[Market] Agmarknet: 0 records for state='{candidate}' — trying next candidate if any")
         except Exception as e:
-            print(f"[Market] Agmarknet error for state='{candidate}': {e}")
+            logger.warning(f"[Market] Agmarknet error for state='{candidate}': {e}")
             continue
 
     if not records:
-        print(f"[Market] Agmarknet: no usable records for {state} after trying all name variants")
+        logger.warning(f"[Market] Agmarknet: no usable records for {state} after trying all name variants")
         return {}
 
     # Log the exact keys of the first record once, so if parsing still
     # fails you can see the real field names by checking your app logs.
-    print(f"[Market] Sample record keys for {state}: {list(records[0].keys())}")
+    logger.info(f"[Market] Sample record keys for {state}: {list(records[0].keys())}")
 
     # A state has many markets/varieties reporting the same commodity —
     # keep the most recent record per commodity.
@@ -872,7 +932,7 @@ def _fetch_state_commodities_raw(state: str) -> dict:
             "modal_price":  modal_price,
         }
 
-    print(f"[Market] {state}: parsed {len(latest_by_commodity)} commodities, "
+    logger.info(f"[Market] {state}: parsed {len(latest_by_commodity)} commodities, "
           f"skipped {skipped_no_price} records (missing/invalid price or name)")
     return latest_by_commodity
 
@@ -912,7 +972,7 @@ def fetch_agmarknet_prices_bulk(states: list) -> dict:
             try:
                 raw_by_state[state] = future.result()
             except Exception as e:
-                print(f"[Market] Unexpected error fetching {state}: {e}")
+                logger.warning(f"[Market] Unexpected error fetching {state}: {e}")
                 raw_by_state[state] = {}
 
     # ── Phase 2: ONE load, update every state in memory, ONE save ───────
@@ -949,7 +1009,7 @@ def fetch_agmarknet_prices_bulk(states: list) -> dict:
 
             results_by_state[state] = state_results
             _agmark_fetch_cache[state] = (now, state_results)
-            print(f"[Market] Agmarknet OK for {state}: {len(state_results)} commodities")
+            logger.info(f"[Market] Agmarknet OK for {state}: {len(state_results)} commodities")
 
         _save_history_cache(cache)  # single write for the whole batch
 
@@ -1092,17 +1152,34 @@ def debug_market():
 
 
 # ─── Kisan Helper Chatbot ─────────────────────────────────────────────────────
-_chat_rate = {}
 CHAT_LIMIT  = 20
 
-def _is_rate_limited(ip: str) -> bool:
+# ─── Shared sliding-window rate limiter ───────────────────────────────────────
+# Chat, STT, diagnosis, and translation endpoints each throttle per-IP with the
+# SAME sliding-window logic. One shared implementation (instead of four copies)
+# plus a single lock keeps behaviour identical and thread-safe. The state lives
+# in-process, so it is only consistent under a SINGLE gunicorn worker
+# (see Dockerfile: --workers 1 --threads 8); multi-worker scaling needs Redis.
+_rate_limit_state = {}         # action -> {ip: [timestamps]}
+_rate_limit_state_lock = threading.Lock()
+
+def _rate_limit(action: str, ip: str, limit: int, window_seconds: int = 60) -> bool:
+    """Sliding-window rate limit. Returns True if the request is allowed,
+    False if it exceeds `limit` within `window_seconds`. Thread-safe."""
     now = datetime.now().timestamp()
-    times = [t for t in _chat_rate.get(ip, []) if now - t < 60]
-    _chat_rate[ip] = times
-    if len(times) >= CHAT_LIMIT:
+    with _rate_limit_state_lock:
+        bucket = _rate_limit_state.setdefault(action, {})
+        times = [t for t in bucket.get(ip, []) if now - t < window_seconds]
+        if len(times) >= limit:
+            bucket[ip] = times
+            return False
+        times.append(now)
+        bucket[ip] = times
         return True
-    _chat_rate[ip].append(now)
-    return False
+
+
+def _is_rate_limited(ip: str) -> bool:
+    return not _rate_limit("chat", ip, CHAT_LIMIT)
 
 
 # ─── Chatbot topic gate (#chat-limits) ──────────────────────────────────────
@@ -1355,19 +1432,12 @@ STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. N
 # standard MediaRecorder API (supported on Chrome, Safari/iOS, Firefox, Edge,
 # all Android browsers) and transcribed server-side — no dependency on the
 # patchy, Chrome-only browser SpeechRecognition API.
-_stt_rate = {}
 STT_LIMIT = 20
 MAX_AUDIO_B64_LEN = 8 * 1024 * 1024  # ~6 MB raw audio, generous for a voice note
 
 
 def _is_rate_limited_stt(ip: str) -> bool:
-    now = datetime.now().timestamp()
-    times = [t for t in _stt_rate.get(ip, []) if now - t < 60]
-    _stt_rate[ip] = times
-    if len(times) >= STT_LIMIT:
-        return True
-    _stt_rate[ip].append(now)
-    return False
+    return not _rate_limit("stt", ip, STT_LIMIT)
 
 
 @app.route("/api/stt", methods=["POST"])
@@ -1411,18 +1481,17 @@ def speech_to_text():
             headers=headers, files=files, data=form_data, timeout=30
         )
         if resp.status_code != 200:
-            print(f"[STT error] {resp.status_code}: {resp.text[:300]}")
+            logger.warning(f"[STT error] {resp.status_code}: {resp.text[:300]}")
             return jsonify({"error": "Could not transcribe audio"}), 500
         text = resp.json().get("text", "").strip()
         return jsonify({"text": text})
     except Exception as e:
-        print(f"[STT exception] {e}")
+        logger.warning(f"[STT exception] {e}")
         return jsonify({"error": str(e)}), 500
 
 
 # ─── Diagnose Crop via Groq Vision ───────────────────────────────────────────
 MAX_IMAGE_B64_LEN = 2 * 1024 * 1024
-_diagnose_rate = {}
 DIAGNOSE_LIMIT  = 10
 
 # Vision-capable models tried per ensemble pass. Today Groq only has one
@@ -1436,13 +1505,7 @@ vision_models = [
 
 
 def _is_rate_limited_diagnose(ip: str) -> bool:
-    now = datetime.now().timestamp()
-    times = [t for t in _diagnose_rate.get(ip, []) if now - t < 60]
-    _diagnose_rate[ip] = times
-    if len(times) >= DIAGNOSE_LIMIT:
-        return True
-    _diagnose_rate[ip].append(now)
-    return False
+    return not _rate_limit("diagnose", ip, DIAGNOSE_LIMIT)
 
 
 # ── Step 0: cheap pre-classifier ─────────────────────────────────────────
@@ -1487,7 +1550,7 @@ def ai_is_crop_image(image_b64):
         parsed = json.loads(match.group() if match else cleaned)
         return bool(parsed.get("is_plant", True)), parsed.get("reason")
     except Exception as e:
-        print(f"[PreClassifier] error: {e}")
+        logger.warning(f"[PreClassifier] error: {e}")
         return True, None  # fail open
 
 
@@ -1547,7 +1610,7 @@ def _run_gemini_pass(image_b64, prompt, sys_prompt):
     try:
         resp = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=45)
         if resp.status_code != 200:
-            print(f"[Diagnose] Gemini HTTP {resp.status_code}: {resp.text[:200]}")
+            logger.warning(f"[Diagnose] Gemini HTTP {resp.status_code}: {resp.text[:200]}")
             return None
         raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -1556,7 +1619,7 @@ def _run_gemini_pass(image_b64, prompt, sys_prompt):
             return None
         return json.loads(match.group())
     except Exception as e:
-        print(f"[Diagnose] Gemini exception: {e}")
+        logger.warning(f"[Diagnose] Gemini exception: {e}")
         return None
 
 
@@ -1589,7 +1652,7 @@ def _save_diagnosis_image(image_b64, record_id):
             f.write(raw)
         return filename
     except Exception as e:
-        print(f"[DiagnosisLog] Could not save image: {e}")
+        logger.warning(f"[DiagnosisLog] Could not save image: {e}")
         return None
 
 
@@ -1603,7 +1666,7 @@ def _log_diagnosis(record):
             with open(DIAGNOSIS_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
-        print(f"[DiagnosisLog] Could not write log entry: {e}")
+        logger.warning(f"[DiagnosisLog] Could not write log entry: {e}")
 
 
 @app.route("/api/diagnose", methods=["POST"])
@@ -1707,7 +1770,7 @@ Respond ONLY with valid JSON, no markdown or backticks:
                 return _run_gemini_pass(image_b64, prompt, sys_prompt)
             return _run_vision_pass(image_b64, prompt, sys_prompt, model, temp)
         except Exception as e:
-            print(f"[Diagnose] pass {i} ({model}) failed: {e}")
+            logger.warning(f"[Diagnose] pass {i} ({model}) failed: {e}")
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(pass_plan)) as executor:
@@ -1863,8 +1926,12 @@ def diagnose_log_review():
                     updated = True
                     break
             if updated:
-                with open(DIAGNOSIS_LOG_PATH, "w", encoding="utf-8") as f:
+                # Rewrite ATOMICALLY so a crash mid-rewrite can't truncate or
+                # corrupt the audit log. The whole read-modify-write is already
+                # under _diagnosis_log_lock.
+                with open(DIAGNOSIS_LOG_PATH + ".tmp", "w", encoding="utf-8") as f:
                     f.writelines(lines)
+                os.replace(DIAGNOSIS_LOG_PATH + ".tmp", DIAGNOSIS_LOG_PATH)
         return jsonify({"status": "ok" if updated else "not_found"}), (200 if updated else 404)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2304,7 +2371,7 @@ def _translate_terms_chunk(terms_chunk, lang_name, domain_note):
             last_error = str(e)
             continue
 
-    print(f"[Translate] chunk of {len(terms_chunk)} terms to {lang_name} failed on all models: {last_error}")
+    logger.info(f"[Translate] chunk of {len(terms_chunk)} terms to {lang_name} failed on all models: {last_error}")
     return {term: term for term in terms_chunk}
 
 
@@ -2345,17 +2412,10 @@ def _translate_terms(terms, lang_name, domain_note, cache_key, cache_dict):
     return translations, False
 
 
-_translate_rate = {}
 TRANSLATE_LIMIT = 20
 
 def _is_rate_limited_translate(ip: str) -> bool:
-    now = datetime.now().timestamp()
-    times = [t for t in _translate_rate.get(ip, []) if now - t < 60]
-    _translate_rate[ip] = times
-    if len(times) >= TRANSLATE_LIMIT:
-        return True
-    _translate_rate[ip].append(now)
-    return False
+    return not _rate_limit("translate", ip, TRANSLATE_LIMIT)
 
 
 # ─── Market Translation ───────────────────────────────────────────────────────
@@ -2391,7 +2451,7 @@ def translate_market():
     domain_note = "Crop names should be the common local/mandi name a farmer would recognize, not a literal translation."
     translations, cached = _translate_terms(terms, lang_name, domain_note, lang, _translation_cache)
 
-    print(f"[Translate] {len(translations)} terms ready for {lang_name} ({'cache' if cached else 'fresh'})")
+    logger.info(f"[Translate] {len(translations)} terms ready for {lang_name} ({'cache' if cached else 'fresh'})")
     return jsonify({"lang": lang, "lang_name": lang_name, "translations": translations, "cached": cached})
 
 
@@ -2526,7 +2586,7 @@ def translate_alerts():
     )
     translations, cached = _translate_terms(terms, lang_name, domain_note, lang, _alerts_translation_cache)
 
-    print(f"[AlertsTranslate] {len(translations)} terms for {lang_name} ({'cache' if cached else 'fresh'})")
+    logger.info(f"[AlertsTranslate] {len(translations)} terms for {lang_name} ({'cache' if cached else 'fresh'})")
     return jsonify({"lang": lang, "lang_name": lang_name, "translations": translations, "cached": cached})
 
 # ─── Dashboard Translation ────────────────────────────────────────────────────
@@ -2597,7 +2657,7 @@ def translate_dashboard():
     domain_note = "Crop, pest, and field-activity names should be the common name farmers actually use, not a literal translation."
     translations, cached = _translate_terms(terms, lang_name, domain_note, lang, _dashboard_translation_cache)
 
-    print(f"[DashboardTranslate] {len(translations)} terms ready for {lang_name} ({'cache' if cached else 'fresh'})")
+    logger.info(f"[DashboardTranslate] {len(translations)} terms ready for {lang_name} ({'cache' if cached else 'fresh'})")
     return jsonify({"lang": lang, "lang_name": lang_name, "translations": translations, "cached": cached})
 
 # ─── Diagnose Page Translation (static UI text) ───────────────────────────────
@@ -2676,7 +2736,7 @@ def translate_diagnose():
     domain_note = "This is UI copy and section labels for a crop-disease-diagnosis app. Keep tone simple and clear for farmers; keep numbers/units/file types (JPG, PNG, WEBP, MB, cm) unchanged."
     translations, cached = _translate_terms(terms, lang_name, domain_note, lang, _diagnose_translation_cache)
 
-    print(f"[DiagnoseTranslate] {len(translations)} terms ready for {lang_name} ({'cache' if cached else 'fresh'})")
+    logger.info(f"[DiagnoseTranslate] {len(translations)} terms ready for {lang_name} ({'cache' if cached else 'fresh'})")
     return jsonify({"lang": lang, "lang_name": lang_name, "translations": translations, "cached": cached})
 
 
