@@ -21,6 +21,10 @@ COPY . .
 EXPOSE 7860
 
 # Run with Gunicorn for production reliability
-# - 2 workers per CPU core is a common starting point for I/O-bound Flask apps
+# - A SINGLE worker is intentional: Shared in-memory state (rate limiters,
+#   translation caches) must stay consistent; multiple workers each carry
+#   their own copy. Concurrency comes from request *threads* instead, which
+#   suits this I/O-bound app (network calls dominate). Move to Redis + more
+#   workers if you ever need to scale beyond one process.
 # - bind to 0.0.0.0 so the container port is reachable from outside
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--workers", "2", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--workers", "1", "--threads", "8", "--timeout", "120", "app:app"]
