@@ -336,20 +336,24 @@ def get_ndvi():
     return jsonify(result)
 
 
-# ─── Weather API ─────────────────────────────────────────────────────────────
-@app.route("/api/weather")
-def get_weather():
-    if not OPENWEATHER_API_KEY:
-        return jsonify({"error": "Weather is not configured on this server. Set OPENWEATHER_API_KEY in .env."}), 500
+# Small TTL cache so repeated chat weather/alerts asks (and dashboard reloads)
+# never hammer OpenWeather for the same spot within a few minutes.
+_weather_cache = {}
+_WEATHER_CACHE_TTL = 300  # seconds
 
-    lat = request.args.get("lat")
-    lon = request.args.get("lon")
-    if not lat or not lon:
-        return jsonify({"error": "Location required"}), 400
-    try:
-        lat, lon = float(lat), float(lon)
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid coordinates"}), 400
+def _fetch_current_weather(lat, lon):
+    """Live OpenWeather current + 7-day forecast. Shared by the /api/weather
+    route AND the Kisan Helper feature gateway, so the chatbot's answers are
+    built from the exact same data the dashboard shows. Returns the same dict
+    shape as /api/weather, or None on any failure / missing API key."""
+    if not OPENWEATHER_API_KEY:
+        return None
+
+    cache_key = f"{round(lat, 2)},{round(lon, 2)}"
+    now_ts = time.monotonic()
+    cached = _weather_cache.get(cache_key)
+    if cached and (now_ts - cached[0]) < _WEATHER_CACHE_TTL:
+        return cached[1]
 
     try:
         current_resp  = requests.get("https://api.openweathermap.org/data/2.5/weather",
@@ -358,7 +362,8 @@ def get_weather():
             params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "cnt": 56}, timeout=10)
 
         if current_resp.status_code != 200:
-            return jsonify({"error": f"Weather API error: {current_resp.text}"}), 500
+            logger.warning(f"[Weather] Current API error: {current_resp.text}")
+            return None
         if forecast_resp.status_code != 200:
             logger.warning(f"[Weather] Forecast API error: {forecast_resp.text}")
 
@@ -388,7 +393,7 @@ def get_weather():
 
         forecast_list = list(daily.values())[:7]
 
-        return jsonify({
+        result = {
             "current": {
                 "city":        current_data.get("name", "Your Location"),
                 "lat":         float(lat),
@@ -399,15 +404,39 @@ def get_weather():
                 "description": current_data["weather"][0]["description"],
                 "icon":        current_data["weather"][0]["icon"],
                 "wind_speed":  current_data.get("wind", {}).get("speed", 0),
-                "pressure":    current_data["main"]["pressure"],
+                "pressure":    current_data["main"].get("pressure", 0),
                 "visibility":  current_data.get("visibility", 0) / 1000,
                 "rain":        current_data.get("rain", {}).get("1h", 0),
             },
             "forecast": forecast_list
-        })
+        }
+        _weather_cache[cache_key] = (time.monotonic(), result)
+        return result
     except Exception as e:
         logger.warning(f"[Weather error] {e}")
-        return jsonify({"error": str(e)}), 500
+        return None
+
+
+# ─── Weather API ─────────────────────────────────────────────────────────────
+# ─── Weather API ─────────────────────────────────────────────────────────────
+@app.route("/api/weather")
+def get_weather():
+    if not OPENWEATHER_API_KEY:
+        return jsonify({"error": "Weather is not configured on this server. Set OPENWEATHER_API_KEY in .env."}), 500
+
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    if not lat or not lon:
+        return jsonify({"error": "Location required"}), 400
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid coordinates"}), 400
+
+    weather = _fetch_current_weather(lat, lon)
+    if weather is None:
+        return jsonify({"error": "Weather service unavailable right now. Please try again in a moment."}), 500
+    return jsonify(weather)
 
 
 # ─── Crop Recommendations ────────────────────────────────────────────────────
@@ -1344,6 +1373,435 @@ def _off_topic_reply(lang: str) -> str:
     return _OFF_TOPIC_REPLIES.get(lang, _OFF_TOPIC_REPLIES["en"])
 
 
+# ── Kisan Helper Feature Gateway ───────────────────────────────────────────
+# The chatbot is the single entry point for EVERY SmartAgro feature. When a
+# farmer asks about weather, alerts, market prices, crop recommendations,
+# disease diagnosis or seasonal advice, these helpers detect the intent, run
+# the REAL feature (the same functions the page routes use), and inject the
+# live results into the LLM context so the reply is grounded in actual data.
+# Interactive features (diagnosis, full-page views) also emit "action chips"
+# that the frontend renders as one-tap navigation buttons.
+
+_CHAT_FEATURE_KEYWORDS = {
+    "weather": [
+        "weather", "mausam", "मौसम", "temp", "temperature", "temprature",
+        "rain", "rainfall", "barish", "बारिश", "sunny", "धूप", "thunder",
+        "storm", "wind", "hawa", "हवा", "forecast", "mosam",
+    ],
+    "alerts": [
+        "alert", "warning", "risk", "danger", "खतरा", "savdhan", "सावधान",
+        "pest", "कीट", "fungus", "fungal", "blight", "harmful",
+        "attack", "hamla", "हमला",
+    ],
+    "market": [
+        "price", "prices", "mandi", "मंडी", "market", "bhav", "भाव",
+        "rate", "rates", "cost", "demand", "sell", "buy", "commodity",
+        "ky rate", "kray",
+    ],
+    "crops": [
+        "recommend", "suggest", "suitable", "what to grow", "which crop",
+        "best crop", "kaun si fasal", "कौन सी फसल", "fasal", "फसल",
+        "grow", "उगाएं", "boon", "बुवाई",
+    ],
+    "diagnosis": [
+        "diagnose", "disease", "बीमारी", "rogi", "रोग", "leaf", "पत्ता",
+        "पत्ती", "spot", "धब्बा", "wilt", "मुरझाया", "rot", "सड़न",
+        "yellow leaf", "पीली पत्ती", "upload", "photo", "image",
+        "symptoms", "infection", "लक्षण",
+    ],
+    "seasonal": [
+        "season", "kharif", "rabi", "zaid", "advisory", "monthly",
+        "calendar", "sowing", "harvest season", "मौसमी", "सलाह",
+    ],
+}
+
+_FEATURE_LABEL_MAP = {
+    "weather":   ("🌤️ Weather", "/"),
+    "alerts":    ("⚠️ Alerts", "/alerts"),
+    "market":    ("🏪 Market Prices", "/market"),
+    "diagnosis": ("📷 Diagnose Crop", "/diagnose"),
+    "crops":     ("🌾 Crop Suggestions", "/"),
+    "seasonal":  ("🗓️ Seasonal Advice", "/alerts"),
+}
+
+_RECOGNISED_CITIES = sorted(CITY_STATE.keys(), key=len, reverse=True)
+
+
+# Crop commodities the market tool can pin-point in a question, mapped to the
+# exact display names used by the market data (MSP_REFERENCE_PRICES / Agmarknet).
+# English/Latin keywords match on word boundaries so "rice" never matches inside
+# "price"; Indian-script words use substring matching to catch inflected forms.
+_CHAT_COMMODITY_KEYWORDS = {
+    "Wheat":                ["wheat", "गेहूं", "गेहूँ", "gehu", "kannak", "कनक"],
+    "Rice":                 ["rice", "paddy", "dhaan", "चावल", "धान"],
+    "Maize (Corn)":         ["maize", "corn", "makka", "मक्का", "bhutta"],
+    "Mustard":              ["mustard", "sarson", "सरसों", "rai"],
+    "Groundnut":            ["groundnut", "peanut", "moongfali", "मूंगफली"],
+    "Onion":                ["onion", "pyaaz", "प्याज", "kanda"],
+    "Tomato":               ["tomato", "tamatar", "टमाटर"],
+    "Potato":               ["potato", "aloo", "aalu", "आलू"],
+    "Bengal Gram (Chana)":  ["chana", "channa", "bengal gram", "चना"],
+    "Cotton":               ["cotton", "kapas", "कपास", "rui"],
+    "Soybean":              ["soybean", "soya", "soyabean", "सोयाबीन"],
+    "Sugarcane":            ["sugarcane", "ganna", "गन्ना"],
+    "Pearl Millet (Bajra)": ["bajra", "pearl millet", "बाजरा"],
+    "Sorghum (Jowar)":      ["jowar", "sorghum", "ज्वार"],
+    "Chili":                ["chili", "chilli", "mirchi", "mirch", "मिर्च"],
+    "Turmeric":             ["turmeric", "haldi", "हल्दी"],
+}
+
+# City aliases so older/informal English names still resolve correctly.
+_CHAT_CITY_ALIASES = {
+    "calcutta":  "Kolkata",
+    "bombay":    "Mumbai",
+    "madras":    "Chennai",
+    "bangalore": "Bengaluru",
+    "new delhi": "Delhi",
+}
+
+
+def _chat_detect_commodity(text):
+    """Find the crop/commodity the farmer is asking about (e.g. 'wheat',
+    'गेहूं', 'tomato'). Returns the market display name, or '' if none."""
+    import re
+    if not text:
+        return ""
+    t = " " + (text or "").lower() + " "
+    for name, kws in _CHAT_COMMODITY_KEYWORDS.items():
+        for kw in kws:
+            if kw.isascii():
+                if re.search(r"\b" + re.escape(kw) + r"\b", t):
+                    return name
+            else:
+                if kw in t:
+                    return name
+    return ""
+
+
+def _chat_detect_city(text):
+    """Find an app-known city name inside the message so location-specific
+    features (market, seasonal advice) can target the right place."""
+    if not text:
+        return ""
+    t = text.lower()
+    for alias, city in _CHAT_CITY_ALIASES.items():
+        if alias in t:
+            return city
+    for city in _RECOGNISED_CITIES:
+        if city.lower() in t:
+            return city
+    return ""
+
+
+def _chat_detect_intents(text):
+    """Map a message to the SmartAgro features it needs.
+    Latin keywords use word boundaries (so 'rain' never matches 'drainage').
+    Indian-script keywords use substring matching — Devanagari/other scripts
+    encode inflection with combining marks that \b treats as non-word chars
+    (e.g. फसलों / फसले would break \bफसल\b), while a plain substring cleanly
+    catches all the inflected forms of a root word."""
+    import re
+    t = (text or "").lower()
+    padded = " " + t + " "
+    matched = set()
+    for feature, kws in _CHAT_FEATURE_KEYWORDS.items():
+        for kw in kws:
+            if kw.isascii():
+                if re.search(r"\b" + re.escape(kw) + r"\b", padded):
+                    matched.add(feature)
+                    break
+            else:
+                if kw in t:
+                    matched.add(feature)
+                    break
+    return matched
+
+# ── Gateway tool implementations ────────────────────────────────────────────
+# Each tool runs the exact same functions the page routes use, so a farmer
+# asking the chatbot gets LIVE numbers — never a stale guess.
+
+def _chat_weather_tool(lat, lon):
+    if not lat or not lon:
+        return {"ok": False, "reason": "no_location"}
+    w = _fetch_current_weather(float(lat), float(lon))
+    if not w:
+        return {"ok": False, "reason": "unavailable"}
+    cur, fc = w.get("current") or {}, w.get("forecast") or []
+    f_str = "; ".join(
+        f"{d.get('date')}: {d.get('temp_max')}°C/{d.get('temp_min')}°C, "
+        f"{d.get('humidity')}% RH, {d.get('rain')}mm rain, {d.get('description')}"
+        for d in fc[:5] if isinstance(d, dict)
+    )
+    return {
+        "ok": True,
+        "city": cur.get("city"),
+        "temp_c": cur.get("temp"),
+        "humidity_pct": cur.get("humidity"),
+        "description": cur.get("description"),
+        "wind_mps": cur.get("wind_speed"),
+        "rain_mm": cur.get("rain"),
+        "forecast_text": f_str,
+    }
+
+
+def _chat_alerts_tool(lat, lon):
+    if not lat or not lon:
+        return {"ok": False, "reason": "no_location"}
+    w = _fetch_current_weather(float(lat), float(lon))
+    if not w:
+        return {"ok": False, "reason": "unavailable"}
+    cur = w.get("current") or {}
+    alerts_list = _rule_alerts(
+        float(cur.get("temp", 25)),
+        float(cur.get("humidity", 60)),
+        float(cur.get("wind_speed", 10)),
+        float(cur.get("rain", 0)),
+        cur.get("description", ""),
+    )
+    return {
+        "ok": True,
+        "city": cur.get("city"),
+        "count": len(alerts_list),
+        "alerts": [
+            {"title": a["title"], "message": a["message"],
+             "action": a["action"], "category": a["category"]}
+            for a in alerts_list
+        ],
+    }
+
+
+def _chat_crops_tool(lat, lon, city):
+    season = get_season(datetime.now().month)
+    if not lat or not lon:
+        base = recommend_crops(25, 60, 0, season)
+        return {
+            "ok": True, "season": season, "city": city or "your area",
+            "crops": [{"name": c.get("name"), "match": c.get("match")}
+                      for c in (base or [])][:6],
+        }
+    w = _fetch_current_weather(float(lat), float(lon))
+    do_temp = float(w["current"]["temp"]) if w else 25
+    do_hum  = float(w["current"]["humidity"]) if w else 60
+    do_rain = float(w["current"].get("rain") or 0) if w else 0
+    crops = ai_recommend_crops(city or "", float(lat), float(lon),
+                                do_temp, do_hum, do_rain, season)
+    if not crops:
+        crops = recommend_crops(do_temp, do_hum, do_rain, season) or []
+    return {
+        "ok": True, "season": season, "city": city or "",
+        "crops": [{"name": c.get("name"), "match": c.get("match"),
+                    "description": c.get("description")}
+                  for c in crops[:6] if isinstance(c, dict)],
+    }
+
+
+def _chat_fetch_market_rows(city, state):
+    """Fastest mandi rows available for a city:
+       1. fresh in-memory Agmarknet cache (instant),
+       2. bounded live Agmarknet fetch — max ~6 s so the chat never stalls,
+       3. deterministic MSP-reference fallback (always works, even offline)."""
+    if state:
+        cached_state = _agmark_fetch_cache.get(state)
+        if cached_state and (time.monotonic() - cached_state[0]) < AGMARK_CACHE_TTL_SEC:
+            rows = list(cached_state[1])
+            if rows:
+                return rows
+    if state and DATA_GOV_API_KEY:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(fetch_agmarknet_prices_bulk, [state])
+            try:
+                state_result = fut.result(timeout=6)
+                rows = list(state_result.get(state, []))
+                if rows:
+                    return rows
+            except Exception as exc:
+                logger.warning(f"[ChatMarket] live fetch failed for {state}: {exc}")
+    return list(get_dynamic_mandi_fallback(city) or [])
+
+
+def _chat_market_tool(city, commodity=""):
+    """Live mandi prices for a city (fast path → live path → offline fallback).
+    If the farmer named a commodity ('wheat', 'गेहूं'), `focus` lists its rows
+    first so the reply can quote the exact price they asked about."""
+    if not city:
+        return {"ok": False, "reason": "no_city"}
+    state = CITY_STATE.get(city, "")
+    rows = _chat_fetch_market_rows(city, state)
+    items = [
+        {"crop": c.get("crop"), "price": c.get("price"),
+         "change_pct": c.get("change", 0), "source": c.get("source")}
+        for c in rows
+    ]
+    focus = []
+    if commodity:
+        cl = commodity.lower()
+        focus = [i for i in items if cl in (i["crop"] or "").lower()]
+    return {
+        "ok": True, "city": city, "state": state,
+        "commodity": commodity,
+        "focus": focus[:3],
+        "items": items[:8],
+    }
+
+
+def _chat_seasonal_tool(city):
+    season = get_season(datetime.now().month)
+    advisories = _seasonal_advisories(season, city or "")
+    return {
+        "ok": True, "season": season, "city": city or "",
+        "advisories": [
+            {"category": r["category"], "title": r["title"],
+             "message": r["message"], "action": r.get("action")}
+            for r in advisories
+        ],
+    }
+
+def _chat_run_gateway(intents, context_data):
+    """Execute the requested features and return (sections, actions, summaries).
+    sections  — [] str, appended to the LLM's context so the reply uses LIVE data.
+    actions   — [] dict {type,label,url}, navigation chips for the frontend.
+    summaries — [] str, brief one-line LIVE-data cards appended to the reply so
+                the farmer is GUARANTEED to see the fetched numbers even if the
+                model's wording omits them."""
+    lat = context_data.get("lat")
+    lon = context_data.get("lon")
+    city = context_data.get("city") or context_data.get("user_city") or ""
+    commodity = context_data.get("commodity") or ""
+    sections = []
+    actions = []
+    summaries = []
+    seen = set()
+
+    if "weather" in intents:
+        res = _chat_weather_tool(lat, lon)
+        if res.get("ok"):
+            sections.append(
+                f"[LIVE WEATHER] City: {res.get('city') or 'your location'} | "
+                f"Now: {res.get('temp_c')}°C, {res.get('humidity_pct')}% RH, "
+                f"{res.get('description')}, {res.get('wind_mps')} m/s wind, "
+                f"{res.get('rain_mm')} mm rain\n"
+                f"7-day outlook: {res.get('forecast_text')}"
+            )
+            summaries.append(
+                f"🌤️ {res.get('city')}: {res.get('temp_c')}°C, "
+                f"{res.get('humidity_pct')}% humidity, {res.get('description')}."
+            )
+        else:
+            sections.append(
+                "[WEATHER] Could not fetch live weather. Ask the farmer for "
+                "their location so you can check weather and alerts for them."
+            )
+
+    if "alerts" in intents:
+        res = _chat_alerts_tool(lat, lon)
+        if res.get("ok") and res.get("alerts"):
+            lines = "\n".join(
+                f"- [{a['category']}] {a['title']}: {a['message']} → {a['action']}"
+                for a in res["alerts"]
+            )
+            sections.append(
+                f"[LIVE WEATHER-BASED ALERTS] {res.get('city') or 'your area'}\n{lines}"
+            )
+            first = res["alerts"][0]
+            summaries.append(f"⚠️ {res.get('city')}: {first['title']} — {first['message']}")
+        elif res.get("ok"):
+            summaries.append(f"✅ {res.get('city')}: no active pest or weather alerts right now.")
+        else:
+            sections.append(
+                "[WEATHER ALERTS] No live alerts were computed right now. You can "
+                "still give general advice about pests and diseases."
+            )
+
+    if "market" in intents:
+        res = _chat_market_tool(city, commodity)
+        if res.get("ok") and res.get("items"):
+            shown = res.get("focus") or res.get("items", [])[:3]
+            rows_str = "\n".join(
+                f"  • {i['crop']}: ₹{i['price']}/q ({i['change_pct']}%)"
+                for i in shown
+            )
+            asked = f" — asked about {commodity}" if commodity else ""
+            sections.append(
+                f"[LIVE MANDI PRICES] {res.get('city')}, {res.get('state')}{asked}\n{rows_str}"
+            )
+            fallback_items = res.get("focus") if res.get("focus") else res.get("items", [])
+            for i in fallback_items[:3]:
+                arrow = "▲" if i["change_pct"] >= 0 else "▼"
+                summaries.append(f"🏪 {res.get('city')}: {i['crop']} ₹{i['price']}/q {arrow} {i['change_pct']}%")
+        elif res.get("reason") == "no_city":
+            sections.append(
+                "[MARKET PRICES] Ask the farmer which city they want mandi rates "
+                "for, then check the live prices for that city."
+            )
+        else:
+            sections.append(
+                "[MARKET PRICES] Prices unavailable right now. The data service "
+                "(Agmarknet / data.gov.in) may be slow or offline — answer from "
+                "your general knowledge and suggest checking the Market tab."
+            )
+
+    if "crops" in intents:
+        res = _chat_crops_tool(lat, lon, city)
+        if res.get("ok") and res.get("crops"):
+            crops = "\n".join(
+                f"  • {c['name']} — {c.get('match', '')}"
+                for c in res["crops"]
+            )
+            sections.append(
+                f"[CROP RECOMMENDATIONS] Season: {res.get('season')}, "
+                f"Location: {res.get('city') or 'general'}\n{crops}"
+            )
+            summaries.append(
+                f"🌾 Recommended for {res.get('season')}: "
+                + ", ".join(c["name"] for c in res["crops"][:4])
+            )
+        else:
+            sections.append(
+                "[CROP RECOMMENDATIONS] Could not compute recommendations right "
+                "now — suggest general season-appropriate crops instead."
+            )
+
+    if "seasonal" in intents:
+        res = _chat_seasonal_tool(city)
+        if res.get("ok") and res.get("advisories"):
+            adv = "\n".join(
+                f"  • [{a['category']}] {a['title']}: {a['message']} → {a['action']}"
+                for a in res["advisories"]
+            )
+            sections.append(
+                f"[SEASONAL ADVISORIES] Season: {res.get('season')}, "
+                f"Location: {res.get('city') or 'general'}\n{adv}"
+            )
+            summaries.append(
+                f"🗓️ {res.get('season')} advice: {res['advisories'][0]['title']}."
+            )
+        else:
+            sections.append(
+                "[SEASONAL ADVISORIES] Could not fetch advisories — answer from "
+                "your general knowledge of the current season."
+            )
+
+    if "diagnosis" in intents:
+        sections.append(
+            "[CROP DIAGNOSIS] You cannot view photos in this chat. Tell the "
+            "farmer you can start the app's crop-diagnosis tool for them, and "
+            "ask them to tap the 📷 Diagnose Crop button (or /diagnose page) and "
+            "upload a clear photo of the affected plant/leaf so the AI can "
+            "analyze it."
+        )
+
+    # Navigation action chips (max 5)
+    for feature in ("diagnosis", "alerts", "market", "weather", "crops", "seasonal"):
+        if feature in intents and feature not in seen:
+            label, url = _FEATURE_LABEL_MAP.get(feature, ("", ""))
+            if label and url:
+                actions.append({"type": "navigate", "label": label, "url": url})
+                seen.add(feature)
+                if len(actions) >= 5:
+                    break
+
+    return sections, actions, summaries
+
 @app.route("/api/chat", methods=["POST"])
 def kisan_chat():
     if not GROQ_API_KEY:
@@ -1378,7 +1836,17 @@ def kisan_chat():
         return jsonify({"reply": _off_topic_reply(lang), "off_topic": True})
 
     context_data = data.get("context", {})
-    
+    if not context_data.get("city"):
+        context_data["city"] = _chat_detect_city(last_user)
+    if not context_data.get("commodity"):
+        context_data["commodity"] = _chat_detect_commodity(last_user)
+
+    # ── Feature Gateway ───────────────────────────────────────────
+    # Detect which SmartAgro features this question maps to and run them
+    # NOW, so the reply can be grounded in live data from the real app.
+    gate_intents = _chat_detect_intents(last_user)
+    gate_sections, gate_actions, gate_summaries = _chat_run_gateway(gate_intents, context_data)
+
     context_str = ""
     if context_data:
         lat, lon = context_data.get("lat"), context_data.get("lon")
@@ -1409,12 +1877,22 @@ STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. N
     if context_str:
         system_prompt += f"\n\nContext about the user's current situation (use this if they ask about weather, location, or what to grow):{context_str}"
 
+    if gate_sections:
+        system_prompt += (
+            "\n\nFEATURE DATA — the app fetched these exact LIVE numbers right now "
+            "from the real sources (same ones the dashboard uses). Your answer to "
+            "this question MUST quote these numbers and say which city/place they "
+            "are for. Never claim the data is unavailable — it is right here. Copy "
+            "the figures verbatim; do not invent or replace them:"
+            "\n" + "\n\n".join(gate_sections)
+        )
+
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     body = {
         "model":       "llama-3.3-70b-versatile",
         "messages":    [{"role": "system", "content": system_prompt}] + messages,
         "temperature": 0.7,
-        "max_tokens":  400,
+        "max_tokens":  700,
         "stream":      False
     }
     try:
@@ -1422,7 +1900,10 @@ STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. N
         if resp.status_code != 200:
             return jsonify({"error": "AI unavailable"}), 500
         reply = resp.json()["choices"][0]["message"]["content"].strip()
-        return jsonify({"reply": reply})
+        if gate_summaries:
+            live_block = "📊 Live data:\n" + "\n".join(gate_summaries)
+            reply = reply.rstrip() + "\n\n" + live_block
+        return jsonify({"reply": reply, "actions": gate_actions})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

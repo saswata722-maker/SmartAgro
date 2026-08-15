@@ -1074,7 +1074,10 @@ body.light-theme .kw-rec-hint   { color: #9ca3af; }
             const reply = data.reply || data.error || 'No response received.';
             chatHistory.push({ role: 'assistant', content: reply });
             if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
-            addBotMsg(reply, true);
+            const kisanMsgId = addBotMsg(reply, true);
+            if (data.actions && data.actions.length) {
+                renderKisanActions(data.actions, kisanMsgId);
+            }
 
         } catch (e) {
             if (typingEl) typingEl.remove();
@@ -1148,7 +1151,57 @@ body.light-theme .kw-rec-hint   { color: #9ca3af; }
         } else {
             textEl.innerHTML = text.split('\n').map(formatLine).join('<br>');
         }
+
+        return id;
     }
+
+    function renderKisanActions(actions, msgId) {
+        const msgs = getMsgs();
+        if (!msgs || !msgId) return;
+        const msgDiv = document.getElementById(msgId);
+        if (!msgDiv) return;
+        const bodyEl = msgDiv.querySelector('.kw-msg-body');
+        if (!bodyEl) return;
+        if (bodyEl.querySelector('.kw-actions')) return;
+
+        const holder = document.createElement('div');
+        holder.className = 'kw-actions';
+        for (const a of actions) {
+            if (!a || !a.url || !a.label) continue;
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'kw-action-chip';
+            chip.textContent = a.label;
+            chip.addEventListener('click', () => {
+                const url = a.url.startsWith('/') ? a.url : '/' + a.url;
+                if (/\/diagnose/.test(url)) toggleKisan();  // close chat, open diagnosis page
+                window.location.href = url;
+            });
+            holder.appendChild(chip);
+        }
+        if (holder.children.length) bodyEl.appendChild(holder);
+    }
+
+    // Gateway action-chip styles (injected once)
+    (() => {
+        if (document.getElementById('kwActionChipStyle')) return;
+        const st = document.createElement('style');
+        st.id = 'kwActionChipStyle';
+        st.textContent = `
+.kw-action-chip {
+  display:inline-flex; align-items:center; gap:6px;
+  background:rgba(34,197,94,.12); color:#4ade80;
+  border:1px solid rgba(34,197,94,.35); border-radius:999px;
+  padding:6px 12px; font-size:12px; font-weight:600; cursor:pointer;
+  transition: background .15s, transform .1s; line-height:1.3;
+  -webkit-tap-highlight-color: transparent; font-family: inherit;
+}
+.kw-action-chip:hover { background:rgba(34,197,94,.24); }
+.kw-action-chip:active { transform: scale(.97); }
+.kw-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; padding:0 12px 6px 46px; }
+`;
+        document.head.appendChild(st);
+    })();
 
     function startTypewriter(textEl, fullText, formatLine, msgId) {
         if (activeTyper) activeTyper.finish();
