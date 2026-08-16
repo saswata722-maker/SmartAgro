@@ -63,6 +63,118 @@ def _log_request(response):
                 request.method, request.path, response.status_code, dur_ms, g.get("request_id", "-"))
     return response
 
+# ── Per-feature usage analytics ─────────────────────────────────────────────
+# Tracks how often each SmartAgro feature is used (page views + API calls) as
+# aggregate counters — NO personal data, NO IPs, NO message content. Counters
+# live in memory and are persisted atomically to a JSON file in batches, so the
+# app never does disk I/O on every request.
+USAGE_LOG_PATH = os.path.join(basedir, "usage_stats.json")
+_USAGE_SAVE_INTERVAL = 30  # seconds between automatic disk writes
+
+_usage_stats = None           # {"since": iso, "features": {ep: {...}}, "daily": {date: count}}
+_usage_lock = threading.Lock()
+_last_usage_save = 0.0
+
+# endpoint (view-function name) → (friendly label, kind)
+_USAGE_FEATURE_LABELS = {
+    "index":                       ("Dashboard Page",               "page"),
+    "diagnose":                    ("Crop Diagnosis Page",         "page"),
+    "market":                      ("Market Page",                 "page"),
+    "alerts":                      ("Alerts Page",                 "page"),
+    "offline":                     ("Offline Page",                "page"),
+    "get_ndvi":                    ("Satellite NDVI",              "api"),
+    "get_weather":                 ("Live Weather",                "api"),
+    "crop_recommendations":        ("Crop Recommendations",        "api"),
+    "get_market_data":             ("Mandi Market Prices",         "api"),
+    "debug_market":                ("Market Debug",                "api"),
+    "kisan_chat":                  ("Kisan Helper Chat",           "api"),
+    "speech_to_text":              ("Voice Input (STT)",           "api"),
+    "diagnose_crop":               ("Crop Diagnosis",              "api"),
+    "diagnose_log":                ("Diagnosis QA Log",            "api"),
+    "diagnose_log_image":          ("Diagnosis QA Image",          "api"),
+    "diagnose_log_review":         ("Diagnosis Review",            "api"),
+    "diagnose_log_accuracy":       ("Diagnosis Accuracy",          "api"),
+    "get_alerts":                  ("Instant Alerts",              "api"),
+    "alerts_forecast":             ("6-Day Forecast Alerts",       "api"),
+    "monthly_alerts":              ("Monthly Outlook Alerts",      "api"),
+    "seasonal_alerts":             ("Seasonal Advisories",         "api"),
+    "crop_risk":                   ("Crop Risk / Harvest Window",  "api"),
+    "translate_market":            ("Market Translation",          "api"),
+    "clear_translation_cache":     ("Translation Cache Clear",     "api"),
+    "translate_alerts":            ("Alerts Translation",          "api"),
+    "translate_dashboard":         ("Dashboard Translation",       "api"),
+    "translate_diagnose":          ("Diagnose Translation",        "api"),
+    "translate_diagnosis_result":  ("Diagnosis Result Translation","api"),
+}
+
+
+def _load_usage_stats():
+    global _usage_stats
+    if _usage_stats is not None:
+        return
+    try:
+        with open(USAGE_LOG_PATH, "r", encoding="utf-8") as f:
+            _usage_stats = json.load(f)
+    except Exception:
+        _usage_stats = {}
+    _usage_stats.setdefault("since", datetime.now().isoformat(timespec="seconds"))
+    _usage_stats.setdefault("features", {})
+    _usage_stats.setdefault("daily", {})
+
+
+def _save_usage_stats():
+    """Atomic write (tmp file + rename) so a crash can never corrupt the log."""
+    if _usage_stats is None:
+        return
+    try:
+        tmp_path = USAGE_LOG_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_usage_stats, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, USAGE_LOG_PATH)
+    except Exception as e:
+        logger.warning(f"[Usage] Could not persist usage stats: {e}")
+
+
+def _flush_usage_stats():
+    """Force a disk write so a reader always sees the freshest counters."""
+    global _last_usage_save
+    with _usage_lock:
+        _load_usage_stats()
+        _save_usage_stats()
+        _last_usage_save = time.monotonic()
+
+
+def _track_usage(endpoint, label=None, kind="api"):
+    global _last_usage_save
+    now = datetime.now()
+    with _usage_lock:
+        _load_usage_stats()
+        feats = _usage_stats["features"]
+        rec = feats.setdefault(endpoint, {
+            "label": label or endpoint, "kind": kind, "count": 0,
+        })
+        rec["count"] += 1
+        rec["last_used"] = now.isoformat(timespec="seconds")
+        today = now.strftime("%Y-%m-%d")
+        _usage_stats["daily"][today] = _usage_stats["daily"].get(today, 0) + 1
+        if time.monotonic() - _last_usage_save >= _USAGE_SAVE_INTERVAL:
+            _last_usage_save = time.monotonic()
+            _save_usage_stats()
+
+
+@app.before_request
+def _track_usage_request():
+    # Count every feature hit automatically. Health probes, static assets and
+    # the analytics endpoints themselves are excluded so they don't skew stats.
+    ep = request.endpoint or ""
+    if not ep or ep == "static" or ep in ("usage", "usage_api", "usage_reset", "healthz"):
+        return
+    label, kind = _USAGE_FEATURE_LABELS.get(ep, (None, "api"))
+    _track_usage(ep, label if label is not None else ep, kind)
+
+
 # ── API keys / secrets — ALWAYS from environment (.env), never hardcoded ────
 # Every value below comes exclusively from os.getenv(). None of them has a
 # real credential baked in as a fallback default: if a variable is missing
@@ -161,6 +273,48 @@ def alerts():
 @app.route('/offline')
 def offline():
     return render_template('offline.html')
+
+
+# ─── Usage Analytics (per-feature) ───────────────────────────────────────────
+@app.route("/usage")
+def usage():
+    return render_template("usage.html")
+
+
+@app.route("/api/usage")
+def usage_api():
+    _flush_usage_stats()
+    with _usage_lock:
+        stats = json.loads(json.dumps(_usage_stats))
+    features = stats.get("features", {})
+    rows = sorted(features.items(), key=lambda kv: -kv[1]["count"])
+    total = sum(rec["count"] for _, rec in rows)
+    by_kind = {}
+    for _, rec in rows:
+        by_kind[rec["kind"]] = by_kind.get(rec["kind"], 0) + rec["count"]
+    return jsonify({
+        "since":   stats.get("since"),
+        "total":   total,
+        "by_kind": by_kind,
+        "daily":   stats.get("daily", {}),
+        "features": [
+            {"endpoint": ep, "label": rec["label"], "kind": rec["kind"],
+             "count": rec["count"], "last_used": rec.get("last_used")}
+            for ep, rec in rows
+        ],
+    })
+
+
+@app.route("/api/usage/reset", methods=["POST"])
+def usage_reset():
+    global _usage_stats
+    if not DEBUG_MODE:
+        return jsonify({"error": "Not available in production. Set FLASK_DEBUG=1 in .env"}), 403
+    with _usage_lock:
+        _usage_stats = {"since": datetime.now().isoformat(timespec="seconds"),
+                        "features": {}, "daily": {}}
+        _save_usage_stats()
+    return jsonify({"ok": True, "total": 0})
 
 
 @app.route('/healthz')
