@@ -4,18 +4,18 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>SmartAgro – Diagnose Crop</title>
-  <link rel="stylesheet" href="/static/css/main.css"/>
-  <link rel="stylesheet" href="/static/css/diagnose.css"/>
+  <link rel="stylesheet" href="{{ static_url('css/main.css') }}"/>
+  <link rel="stylesheet" href="{{ static_url('css/diagnose.css') }}"/>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- PWA -->
-  <link rel="manifest" href="/static/manifest.json"/>
+  <link rel="manifest" href="{{ static_url('manifest.json') }}"/>
   <meta name="theme-color" content="#4ade80"/>
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="apple-mobile-web-app-title" content="SmartAgro"/>
-  <link rel="apple-touch-icon" href="/static/icons/icon-192.png"/>
+  <link rel="apple-touch-icon" href="{{ static_url('icons/icon-192.png') }}"/>
 </head>
 <body>
 
@@ -204,9 +204,10 @@
   <a href="/alerts"><i class="fas fa-bell"></i><span>Alerts</span></a>
 </nav>
 
-<script src="/static/js/translations.js"></script>
-<script src="/static/js/main.js"></script>
-<script src="/static/js/diagnose.js"></script>
-<script src="/static/js/kisan-helper.js"></script>
+<script src="{{ static_url('js/translations_data/en.js') }}"></script>
+<script src="{{ static_url('js/translations.js') }}"></script>
+<script src="{{ static_url('js/main.js') }}"></script>
+<script src="{{ static_url('js/diagnose.js') }}"></script>
+<script src="{{ static_url('js/kisan-helper.js') }}"></script>
 </body>
 </html>

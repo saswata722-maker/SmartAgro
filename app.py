@@ -27,6 +27,7 @@ import base64
 import hashlib
 import difflib
 import threading
+import gzip
 import concurrent.futures
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -62,6 +63,70 @@ def _log_request(response):
     logger.info("%s %s -> %s (%.0fms) rid=%s",
                 request.method, request.path, response.status_code, dur_ms, g.get("request_id", "-"))
     return response
+
+
+@app.after_request
+def _maybe_gzip(response):
+    """gzip-compress text responses when the client accepts it (cuts HTML/CSS/
+    JS/JSON transfer sizes ~70%). Skips errors, tiny bodies, non-text types,
+    and anything that is already compressed."""
+    if request.method == "HEAD" or response.status_code >= 400:
+        return response
+    if getattr(response, "direct_passthrough", False):
+        return response
+    if response.headers.get("Content-Encoding"):
+        return response
+    ct = response.headers.get("Content-Type", "").split(";")[0]
+    if not any(ct.startswith(p) for p in ("text/", "application/javascript",
+            "application/json", "application/xml", "image/svg+xml")):
+        return response
+    payload = response.get_data()
+    if len(payload) < 512 or "gzip" not in request.headers.get("Accept-Encoding", ""):
+        return response
+    try:
+        compressed = gzip.compress(payload, compresslevel=6)
+    except Exception:
+        return response
+    if len(compressed) >= len(payload):
+        return response
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(compressed))
+    response.headers.pop("ETag", None)
+    try:
+        response.vary.add("Accept-Encoding")
+    except Exception:
+        pass
+    return response
+
+
+# ── Cache-busting: every static asset URL gets ?v=<file-mtime> so updates are
+# seen immediately even when a browser/PWA cache is sticky.
+def _static_version(filename):
+    try:
+        return int(os.path.getmtime(os.path.join(app.static_folder or "static", filename)))
+    except Exception:
+        return None
+
+
+@app.context_processor
+def _inject_static_url():
+    def static_url(filename):
+        v = _static_version(filename)
+        return "/static/" + filename + (f"?v={v}" if v else "")
+    return {"static_url": static_url}
+
+
+from flask import url_for as _flask_url_for
+
+def _hashed_url_for(endpoint, **values):
+    if endpoint == "static" and values.get("filename"):
+        v = _static_version(str(values["filename"]))
+        if v:
+            values["v"] = v
+    return _flask_url_for(endpoint, **values)
+
+app.jinja_env.globals["url_for"] = _hashed_url_for
 
 # ── Per-feature usage analytics ─────────────────────────────────────────────
 # Tracks how often each SmartAgro feature is used (page views + API calls) as

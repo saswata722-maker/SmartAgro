@@ -3,7 +3,7 @@
    Handles: offline cache, background sync
 ═══════════════════════════════════════ */
 
-const CACHE_NAME = 'smartagro-v2';
+const CACHE_NAME = 'smartagro-v3';
 const OFFLINE_URL = '/offline';
 
 // Files to cache for offline use
@@ -25,6 +25,7 @@ const STATIC_ASSETS = [
     '/static/js/alerts.js',
     '/static/js/kisan-helper.js',
     '/static/js/market_translate.js',
+    '/static/js/translations_data/en.js',
     '/static/js/translations.js',
     '/static/icons/icon-192.png',
     '/static/icons/icon-512.png',
