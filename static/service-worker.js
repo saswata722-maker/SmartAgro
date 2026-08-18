@@ -3,7 +3,7 @@
    Handles: offline cache, background sync
 ═══════════════════════════════════════ */
 
-const CACHE_NAME = 'smartagro-v3';
+const CACHE_NAME = 'smartagro-v4';
 const OFFLINE_URL = '/offline';
 
 // Files to cache for offline use

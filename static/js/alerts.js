@@ -164,42 +164,22 @@ document.addEventListener('langChanged', (e) => {
 });
 
 /* ── Entry point: request location ─────────── */
+// Alerts reuse the SHARED session-scoped geolocation helper in main.js — one
+// grant lasts the whole browser session. This wrapper only selects the right
+// loader and delegates to the shared helper.
 function requestAlertsLocation() {
-    const btn = document.getElementById('alertLocationBtn');
-
-    // Check session storage first
-    const savedLat = sessionStorage.getItem('userLat');
-    const savedLon = sessionStorage.getItem('userLon');
-    if (savedLat && savedLon) {
-        loadAlertsData(parseFloat(savedLat), parseFloat(savedLon));
-        return;
-    }
-
-    if (btn) {
-        btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>Getting location...</span>`;
-        btn.disabled = true;
-    }
-
-    if (!navigator.geolocation) {
-        showToast('Geolocation not supported. Using default.', 'warning');
-        loadAlertsData(28.6139, 77.2090);
-        return;
-    }
-
-    navigator.geolocation.getCurrentPosition(
-        pos => {
-            sessionStorage.setItem('userLat', pos.coords.latitude);
-            sessionStorage.setItem('userLon', pos.coords.longitude);
-            showToast('📍 Location detected!', 'success');
-            loadAlertsData(pos.coords.latitude, pos.coords.longitude);
-        },
-        () => {
-            showToast('Using default location (Delhi).', 'warning');
-            loadAlertsData(28.6139, 77.2090);
-        }, { timeout: 10000, enableHighAccuracy: true }
-    );
+    window._onLocationReady = (lat, lon) => loadAlertsData(lat, lon);
+    requestLocation();
 }
 
+// Location already granted earlier this session? Load alerts right away
+// instead of making the farmer click "Enable Location" again.
+document.addEventListener('DOMContentLoaded', () => {
+    if (getSavedLocation()) {
+        showToast('📍 Using your saved location for this session.', 'success', 2500);
+        requestAlertsLocation();
+    }
+});
 /* ── Load weather then fetch alerts ─────────── */
 async function loadAlertsData(lat, lon) {
     // Hide location prompt

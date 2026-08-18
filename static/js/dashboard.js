@@ -221,65 +221,20 @@ function retranslateStaticUI() {
     });
 }
 /* ── Entry point: Get Location ──────────────── */
-function requestLocation() {
-    window.requestLocation = window.requestLocation || (() => {});
-    // Call the shared helper from main.js
-    if (typeof window.requestLocation === 'function') {
-        // already defined in main.js, call it with our callback
+// The dashboard uses the SHARED session-scoped geolocation helper in main.js:
+// one grant lasts the whole browser session, so revisits reuse it with no
+// second permission prompt. We only register what to run once a location is
+// known and let the shared helper drive everything.
+window._onLocationReady = (lat, lon) => loadWeatherAndCrops(lat, lon);
+
+// Location already granted earlier this session? Load immediately instead of
+// asking the farmer to click "Get My Location" again.
+document.addEventListener('DOMContentLoaded', () => {
+    if (getSavedLocation()) {
+        showToast('📍 Using your saved location for this session.', 'success', 2500);
+        requestLocation();
     }
-    // Use navigator directly here for dashboard
-    const btn = document.getElementById('locationBtn');
-
-    // Check session storage first
-    const savedLat = sessionStorage.getItem('userLat');
-    const savedLon = sessionStorage.getItem('userLon');
-    if (savedLat && savedLon) {
-        if (btn) {
-            btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
-            btn.style.background = 'linear-gradient(135deg,#166534,#22c55e)';
-        }
-        loadWeatherAndCrops(parseFloat(savedLat), parseFloat(savedLon));
-        return;
-    }
-
-    if (btn) {
-        btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>Getting location...</span>`;
-        btn.disabled = true;
-    }
-
-    if (!navigator.geolocation) {
-        showToast('Geolocation not supported. Using default location.', 'warning');
-        loadWeatherAndCrops(28.6139, 77.2090); // Delhi fallback
-        return;
-    }
-
-    navigator.geolocation.getCurrentPosition(
-        pos => {
-            sessionStorage.setItem('userLat', pos.coords.latitude);
-            sessionStorage.setItem('userLon', pos.coords.longitude);
-            showToast('📍 Location detected!', 'success');
-            if (btn) {
-                btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
-                btn.style.background = 'linear-gradient(135deg,#166534,#22c55e)';
-            }
-            loadWeatherAndCrops(pos.coords.latitude, pos.coords.longitude);
-        },
-        () => {
-            showToast('Using default location (Delhi).', 'warning');
-            if (btn) {
-                btn.innerHTML = `<i class="fas fa-location-crosshairs"></i> <span>Get My Location</span>`;
-                btn.disabled = false;
-            }
-            loadWeatherAndCrops(28.6139, 77.2090);
-            // To this:
-        }, {
-            timeout: 15000, // Gives the browser 15 seconds to find a position
-            enableHighAccuracy: false, // Desktop browsers fail high accuracy if they lack a GPS chip
-            maximumAge: 60000 // Allows utilizing a recently cached location asset
-        }
-    );
-}
-
+});
 /* ── Load weather then crops ────────────────── */
 async function loadWeatherAndCrops(lat, lon) {
     showHeroLoading();

@@ -63,19 +63,61 @@ function showSkeleton(targetId, count, type) {
 /* ── Shared weather state ───────────────────── */
 window.weatherData = null;
 
-/* ── Geolocation helper ─────────────────────── */
+/* ── Shared, session-scoped geolocation helper ──
+   ONE location grant lasts the WHOLE browser session. Coordinates are stored
+   in sessionStorage (automatically cleared when the tab/app is closed), so
+   the dashboard, alerts page and chatbot all reuse the same location with no
+   second permission prompt. Pages register what to run once a location is
+   known via window._onLocationReady(lat, lon); requestLocation() may also be
+   given a direct callback. On denial/error we fail open to Delhi (default). */
+const LOCATION_KEYS = { lat: 'userLat', lon: 'userLon', at: 'userLocAt' };
+
+function getSavedLocation() {
+    try {
+        const lat = sessionStorage.getItem(LOCATION_KEYS.lat);
+        const lon = sessionStorage.getItem(LOCATION_KEYS.lon);
+        const fLat = parseFloat(lat), fLon = parseFloat(lon);
+        if (isFinite(fLat) && isFinite(fLon)) return { lat: fLat, lon: fLon };
+    } catch (e) { /* storage unavailable — just prompt again */ }
+    return null;
+}
+
+function _saveLocation(lat, lon) {
+    try {
+        sessionStorage.setItem(LOCATION_KEYS.lat, String(lat));
+        sessionStorage.setItem(LOCATION_KEYS.lon, String(lon));
+        sessionStorage.setItem(LOCATION_KEYS.at, String(Date.now()));
+    } catch (e) { /* non-fatal — still works for this page */ }
+}
+
+function _markLocationFound(btn) {
+    if (btn) {
+        btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
+        btn.style.background = 'linear-gradient(135deg, #166534, #22c55e)';
+        btn.disabled = false;
+    }
+}
+
+function _markLocationIdle(btn) {
+    if (btn) {
+        btn.innerHTML = `<i class="fas fa-location-crosshairs"></i> <span>Get My Location</span>`;
+        btn.disabled = false;
+    }
+}
+
 function requestLocation(callback) {
     const btn = document.getElementById('locationBtn') || document.getElementById('alertLocationBtn');
-    
-    // Check session storage first
-    const savedLat = sessionStorage.getItem('userLat');
-    const savedLon = sessionStorage.getItem('userLon');
-    if (savedLat && savedLon) {
-        if (btn) {
-            btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
-            btn.style.background = 'linear-gradient(135deg, #166534, #22c55e)';
-        }
-        if (typeof callback === 'function') callback(parseFloat(savedLat), parseFloat(savedLon));
+
+    const runReady = (lat, lon) => {
+        if (typeof callback === 'function') callback(lat, lon);
+        else if (typeof window._onLocationReady === 'function') window._onLocationReady(lat, lon);
+    };
+
+    // One grant is enough for the whole session — reuse the saved coordinates.
+    const saved = getSavedLocation();
+    if (saved) {
+        _markLocationFound(btn);
+        runReady(saved.lat, saved.lon);
         return;
     }
 
@@ -85,44 +127,32 @@ function requestLocation(callback) {
     }
 
     if (!navigator.geolocation) {
-        showToast('Geolocation is not supported by your browser.', 'error');
-        if (btn) {
-            btn.innerHTML = `<i class="fas fa-location-crosshairs"></i> <span>Get My Location</span>`;
-            btn.disabled = false;
-        }
+        showToast('Geolocation is not supported by your browser. Using default location.', 'warning');
+        _markLocationIdle(btn);
+        runReady(28.6139, 77.2090); // Delhi fallback
         return;
     }
 
     navigator.geolocation.getCurrentPosition(
         position => {
             const { latitude, longitude } = position.coords;
-            sessionStorage.setItem('userLat', latitude);
-            sessionStorage.setItem('userLon', longitude);
-            if (btn) {
-                btn.innerHTML = `<i class="fas fa-check"></i> <span>Location Found</span>`;
-                btn.style.background = 'linear-gradient(135deg, #166534, #22c55e)';
-            }
-            showToast('📍 Location detected successfully!', 'success');
-            if (typeof callback === 'function') callback(latitude, longitude);
+            _saveLocation(latitude, longitude);
+            _markLocationFound(btn);
+            showToast('📍 Location saved for this session!', 'success');
+            runReady(latitude, longitude);
         },
         err => {
             console.error('Geolocation error:', err);
-            showToast('Location access denied. Using default location.', 'warning');
-            if (btn) {
-                btn.innerHTML = `<i class="fas fa-location-crosshairs"></i> <span>Get My Location</span>`;
-                btn.disabled = false;
-            }
-            // Fallback: use Delhi, India as default
-            if (typeof callback === 'function') callback(28.6139, 77.2090);
+            showToast('Location access denied. Using default location (Delhi).', 'warning');
+            _markLocationIdle(btn);
+            runReady(28.6139, 77.2090); // Delhi fallback
         }, {
-            timeout: 15000, 
-            enableHighAccuracy: false, 
-            maximumAge: 60000 
+            timeout: 15000,
+            enableHighAccuracy: false,
+            maximumAge: 60000
         }
     );
 }
-
-/* ── Fetch weather from backend ─────────────── */
 async function fetchWeather(lat, lon) {
     try {
         const res = await fetch(`/api/weather?lat=${lat}&lon=${lon}`);
