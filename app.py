@@ -256,6 +256,18 @@ DEBUG_MODE          = os.getenv("FLASK_DEBUG", "0") == "1"
 # it the ensemble simply runs the Groq vision passes as before.
 GEMINI_DIAGNOSIS_MODEL = os.getenv("GEMINI_DIAGNOSIS_MODEL", "gemini-3.1-flash-lite")
 
+# ── AI text-provider: Gemini (free tier) for ALL text helpers ───────────────
+# Kisan Helper chat, the topic gate, CropAI recommendations and multi-language
+# translation all use Google's Gemini flash-lite via its OpenAI-compatible
+# endpoint (free tier). Groq now remains ONLY for Whisper speech-to-text
+# (/api/stt) and the crop-diagnosis vision ensemble, which both require it.
+AI_COMPLETIONS_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+AI_CHAT_MODEL      = os.getenv("AGRO_AI_CHAT_MODEL", "gemini-3.5-flash-lite")
+
+def _ai_headers():
+    """Authorization headers for the Gemini OpenAI-compatible endpoint."""
+    return {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
+
 # ── Optional heavy deps: Sentinel-2 NDVI (live satellite vegetation) ─────
 # rasterio + numpy are only needed for the REAL Sentinel-2 vegetation-health
 # feature. On systems where they aren't installed the app still runs fully —
@@ -713,18 +725,18 @@ exactly this shape:
   ]
 }}"""
 
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    headers = _ai_headers()
     body = {
-        "model":       "llama-3.3-70b-versatile",
+        "model":       AI_CHAT_MODEL,
         "messages":    [{"role": "user", "content": prompt}],
         "temperature": 0.4,
         "max_tokens":  1500,
         "response_format": {"type": "json_object"},
     }
     try:
-        resp = _post_to_groq(body, headers)
+        resp = _post_to_ai(body, headers)
         if resp is None or resp.status_code != 200:
-            logger.warning(f"[CropAI] Groq HTTP {getattr(resp, 'status_code', 'no-response')} for {city}")
+            logger.warning(f"[CropAI] AI HTTP {getattr(resp, 'status_code', 'no-response')} for {city}")
             return None
         raw = resp.json()["choices"][0]["message"]["content"].strip()
         cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -1560,11 +1572,11 @@ def _chat_message_on_topic(text: str) -> bool:
     if any(w in low for w in _CHAT_OFF_TOPIC_RAW):
         return False
     # 3) generic/ambiguous message -> cheap throwaway classifier pass
-    if not GROQ_API_KEY:
+    if not GEMINI_API_KEY:
         return True  # fail open
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    headers = _ai_headers()
     body = {
-        "model": "llama-3.1-8b-instant",          # cheap + fast
+        "model": AI_CHAT_MODEL,
         "messages": [
             {"role": "user", "content": (
                 "You are a strict content filter for Kisan Helper, a farming-only chatbot for Indian farmers. "
@@ -1583,7 +1595,7 @@ def _chat_message_on_topic(text: str) -> bool:
         "max_tokens": 32,
     }
     try:
-        resp = requests.post(GROQ_CHAT_URL, headers=headers, json=body, timeout=8)
+        resp = requests.post(AI_COMPLETIONS_URL, headers=headers, json=body, timeout=8)
         if resp.status_code != 200:
             return True  # fail open
         parsed = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -2049,8 +2061,8 @@ def _chat_run_gateway(intents, context_data):
 
 @app.route("/api/chat", methods=["POST"])
 def kisan_chat():
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY not set in .env"}), 500
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY not set in .env"}), 500
 
     ip = request.remote_addr or "unknown"
     if _is_rate_limited(ip):
@@ -2132,16 +2144,16 @@ STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. N
             "\n" + "\n\n".join(gate_sections)
         )
 
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    headers = _ai_headers()
     body = {
-        "model":       "llama-3.3-70b-versatile",
+        "model":       AI_CHAT_MODEL,
         "messages":    [{"role": "system", "content": system_prompt}] + messages,
         "temperature": 0.7,
         "max_tokens":  700,
         "stream":      False
     }
     try:
-        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=30)
+        resp = requests.post(AI_COMPLETIONS_URL, headers=headers, json=body, timeout=30)
         if resp.status_code != 200:
             return jsonify({"error": "AI unavailable"}), 500
         reply = resp.json()["choices"][0]["message"]["content"].strip()
@@ -2967,10 +2979,10 @@ def crop_risk():
     results.sort(key=lambda x: x["risk"] or 0)   # safest first
     return jsonify({"season": season, "crops": results})
 
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Text AI now talks to Gemini's OpenAI-compatible endpoint (free tier);
+# there is no separate Groq chat URL for text anymore — Whisper STT has its own.
 TRANSLATE_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    AI_CHAT_MODEL,
 ]
 TRANSLATE_CHUNK_SIZE = 40   
 TRANSLATE_MAX_WORKERS = 4  
@@ -2994,14 +3006,15 @@ def _throttle_model(model):
         time.sleep(wait)
 
 
-def _post_to_groq(body, headers, max_retries=2):
-    """POST to Groq with throttling + exponential backoff specifically for
-    HTTP 429 (rate limit). Returns the final requests.Response."""
+def _post_to_ai(body, headers, max_retries=2):
+    """POST to the AI provider (Gemini OpenAI-compatible endpoint) with
+    throttling + exponential backoff specifically for HTTP 429 (rate limit).
+    Returns the final requests.Response."""
     model = body.get("model")
     resp = None
     for attempt in range(max_retries + 1):
         _throttle_model(model)
-        resp = requests.post(GROQ_CHAT_URL, headers=headers, json=body, timeout=45)
+        resp = requests.post(AI_COMPLETIONS_URL, headers=headers, json=body, timeout=45)
         if resp.status_code != 429:
             return resp
         retry_after = resp.headers.get("Retry-After")
@@ -3057,7 +3070,7 @@ Output: a single JSON object only."""
 
 def _translate_terms_chunk(terms_chunk, lang_name, domain_note):
     prompt = _build_translate_prompt(terms_chunk, lang_name, domain_note)
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    headers = _ai_headers()
     max_tokens = min(4096, 300 + len(terms_chunk) * 150)
 
     last_error = None
@@ -3074,10 +3087,10 @@ def _translate_terms_chunk(terms_chunk, lang_name, domain_note):
             "response_format": {"type": "json_object"},
         }
         try:
-            resp = _post_to_groq(body, headers)
+            resp = _post_to_ai(body, headers)
             if resp.status_code == 400:
                 body.pop("response_format", None)
-                resp = _post_to_groq(body, headers)
+                resp = _post_to_ai(body, headers)
             if resp.status_code != 200:
                 last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
                 continue
