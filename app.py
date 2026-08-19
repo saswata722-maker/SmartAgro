@@ -974,6 +974,13 @@ AGMARK_COMMODITY_ALIASES = {
     "banana": "Banana", "mango": "Mango",
 }
 
+# Non-crop commodities that show up in the Agmarknet feed (seafood/animal
+# products) have no place on a crop-mandi page. Any commodity whose name
+# contains one of these keywords is dropped — both when parsing live records
+# and again when each city's list is assembled (so stale entries already
+# persisted in the price-history cache from before this filter also vanish).
+AGMARK_EXCLUDED_COMMODITY_KEYWORDS = ("fish", "prawn", "shrimp", "lobster", "crab")
+
 # Reference prices — the SINGLE source of truth for the offline/MSP-style
 # fallback, used both as the static reference table and as the base prices
 # get_dynamic_mandi_fallback() varies day-to-day. Used ONLY on the rare day
@@ -1161,6 +1168,9 @@ def _fetch_state_commodities_raw(state: str) -> dict:
     skipped_no_price = 0
     for r in records:
         raw_name = str(_field(r, "commodity", "Commodity") or "").strip()
+        if any(k in raw_name.lower() for k in AGMARK_EXCLUDED_COMMODITY_KEYWORDS):
+            skipped_no_price += 1  # not a crop (e.g. fish) — exclude
+            continue
         modal = _field(r, "modal_price", "Modal_x0020_Price", "Modal Price", "modal price")
         if not raw_name or modal is None:
             skipped_no_price += 1
@@ -1291,11 +1301,20 @@ def get_demand(change: float, price_deviation_pct: float) -> str:
        demand meaningfully different across cities/crops even before
        day-over-day trends have had time to build up.
     """
-    score = change + price_deviation_pct
-    if score > 3:     return "Very High"
-    elif score > 0.5: return "High"
-    elif score > -3:  return "Medium"
-    else:             return "Low"
+    # ── Realistic demand scoring ──────────────────────────────────────────
+    # Day-over-day change is the dominant signal in a real mandi: falling
+    # prices mean surplus / weak buying (LOW demand), rising prices mean
+    # buyers competing (HIGH demand). The premium vs the cross-market average
+    # is only a tie-breaker. Both inputs are clamped so one wild data point
+    # (e.g. a -10% crash or a broken +40% premium) can NEVER flip the result
+    # to "Very High demand" — a falling price is never high demand.
+    c = max(-12.0, min(12.0, float(change if change is not None else 0.0)))
+    d = max(-8.0, min(8.0, float(price_deviation_pct if price_deviation_pct is not None else 0.0)))
+    score = 2.0 * c + 0.5 * d
+    if score > 7:     return "Very High"   # strong rally AND/OR above-average price
+    elif score > 2:   return "High"
+    elif score >= -2: return "Medium"
+    else:             return "Low"         # falling or deeply discounted price
 
 
 @app.route('/api/market')
@@ -1329,6 +1348,13 @@ def get_market_data():
         crops = list(state_results_cache.get(state, []))
         if not crops:
             crops = get_dynamic_mandi_fallback(city)
+        # Drop any non-crop commodity (fish/prawn etc.) — this also cleans out
+        # stale entries that were persisted in the price-history cache before
+        # the exclusion filter existed.
+        crops = [
+            c for c in crops
+            if not any(k in str(c.get("crop", "")).lower() for k in AGMARK_EXCLUDED_COMMODITY_KEYWORDS)
+        ]
         city_crop_lists[city] = crops
 
     price_sum = {}
