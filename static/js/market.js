@@ -298,7 +298,9 @@ function renderMarketGrid(markets) {
     const changeLabel = _t('Change') || 'Change';
     const demandLabel = _t('Demand') || 'Demand';
     const cropsLabel = _t('crops') || 'crops';
-    const INITIAL_SHOW = 5;
+    // Each city card is an independent scrollable box: ALL of this city's
+    // crops render inside the card and the card body scrolls, so a long list
+    // never stretches a row and leaves empty space beside shorter cards.
 
     let hasVisible = false;
 
@@ -314,25 +316,22 @@ function renderMarketGrid(markets) {
                 if (filtered.length === 0) return '';
                 hasVisible = true;
 
-                const visibleCrops = filtered.slice(0, INITIAL_SHOW);
-                const hiddenCrops = filtered.slice(INITIAL_SHOW);
                 const cardId = `city-card-${cityIdx}`;
                 const sourceInfo = filtered[0]?.market ? filtered[0].market : '';
                 const arrivalDate = filtered[0]?.arrival_date || '';
 
                 return `
         <div class="city-card" style="animation-delay:${cityIdx * 0.05}s">
-            <div class="city-card-header" onclick="toggleCityCard('${cardId}')" role="button" tabindex="0">
+            <div class="city-card-header">
                 <div class="city-name">
                     <i class="fas fa-location-dot"></i> ${city}
                     ${sourceInfo ? `<span class="city-source-info">${sourceInfo}</span>` : ''}
                 </div>
                 <div class="city-header-right">
                     <span class="city-count">${filtered.length} ${cropsLabel}</span>
-                    <i class="fas fa-chevron-down city-chevron" id="${cardId}-chevron"></i>
                 </div>
             </div>
-            <div class="crop-rows-wrapper collapsed" id="${cardId}">
+            <div class="crop-rows-wrapper" id="${cardId}">
                 <div class="crop-rows">
                     <div class="crop-row-header" style="display:grid;grid-template-columns:1.5fr 1fr 80px 100px;padding:8px 20px;font-size:0.68rem;color:var(--text-3);font-weight:700;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid var(--border)">
                         <span>${cropLabel}</span>
@@ -340,16 +339,7 @@ function renderMarketGrid(markets) {
                         <span>${changeLabel}</span>
                         <span class="cr-demand-hdr">${demandLabel}</span>
                     </div>
-                    ${visibleCrops.map(crop => renderCropRow(crop)).join('')}
-                    ${hiddenCrops.length > 0 ? `
-                    <div class="crop-rows-hidden" id="${cardId}-hidden" style="display:none">
-                        ${hiddenCrops.map(crop => renderCropRow(crop)).join('')}
-                    </div>
-                    <button class="show-more-btn" id="${cardId}-btn" onclick="event.stopPropagation(); toggleCropList('${cardId}')">
-                        <i class="fas fa-chevron-down"></i>
-                        <span>${_t('Show all') || 'Show all'} ${filtered.length} ${cropsLabel}</span>
-                    </button>
-                    ` : ''}
+                    ${filtered.map(crop => renderCropRow(crop)).join('')}
                 </div>
                 ${arrivalDate ? `<div class="city-card-footer"><i class="fas fa-clock"></i> ${_t('Last updated') || 'Last updated'}: ${arrivalDate}</div>` : ''}
             </div>
@@ -388,32 +378,6 @@ function renderCropRow(crop) {
                 ${tDemand(crop.demand)}
             </div>
         </div>`;
-}
-
-function toggleCityCard(cardId) {
-    const wrapper = document.getElementById(cardId);
-    const chevron = document.getElementById(cardId + '-chevron');
-    if (!wrapper) return;
-    wrapper.classList.toggle('collapsed');
-    if (chevron) chevron.classList.toggle('rotated');
-}
-
-function toggleCropList(cardId) {
-    const hidden = document.getElementById(cardId + '-hidden');
-    const btn = document.getElementById(cardId + '-btn');
-    if (!hidden || !btn) return;
-    const isShowing = hidden.style.display !== 'none';
-    hidden.style.display = isShowing ? 'none' : '';
-    const icon = btn.querySelector('i');
-    const span = btn.querySelector('span');
-    if (icon) icon.className = isShowing ? 'fas fa-chevron-down' : 'fas fa-chevron-up';
-    if (span) {
-        const count = hidden.querySelectorAll('.crop-row').length;
-        const topCount = btn.closest('.crop-rows').querySelectorAll(':scope > .crop-row').length;
-        span.textContent = isShowing 
-            ? `${_t('Show all') || 'Show all'} ${topCount + count} ${_t('crops') || 'crops'}`
-            : `${_t('Show less') || 'Show less'}`;
-    }
 }
 
 function getDemandClass(demand) {
@@ -619,6 +583,7 @@ function interpolateHistory(history, targetLen) {
    LINE CHART
 ────────────────────────────────────────────── */
 function buildLineChart(canvas, cityData, city) {
+    // 30-day date labels (oldest -> today)
     const labels = [];
     for (let i = 29; i >= 0; i--) {
         const d = new Date();
@@ -626,47 +591,54 @@ function buildLineChart(canvas, cityData, city) {
         labels.push(d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }));
     }
 
+    // High-contrast palette so the lines stay easy to tell apart.
     const palette = [
-        '#4ade80','#fbbf24','#2dd4bf','#a78bfa',
-        '#f87171','#38bdf8','#fb923c','#e879f9',
-        '#84cc16','#f43f5e','#06b6d4','#8b5cf6',
-        '#ec4899','#10b981','#f59e0b','#3b82f6',
-        '#ef4444','#22c55e','#d946ef','#0ea5e9',
-        '#f97316','#14b8a6','#8b5cf6','#eab308',
-        '#6366f1','#db2777',
+        '#4ade80', '#fbbf24', '#38bdf8', '#a78bfa', '#f87171', '#2dd4bf',
+        '#fb923c', '#e879f9', '#84cc16', '#06b6d4', '#ec4899', '#f59e0b',
     ];
 
     const demandScore = { 'Very High': 4, 'High': 3, 'Medium': 2, 'Low': 1 };
+    // Rank by demand first, then by absolute price move, so the crops that
+    // matter most to a farmer appear at the top of the chart and legend.
     const sorted = [...cityData].sort((a, b) =>
         (demandScore[b.demand] || 0) - (demandScore[a.demand] || 0) ||
         Math.abs(b.change) - Math.abs(a.change)
     );
 
-    const datasets = sorted.map((crop, idx) => {
+    // Only show the top few to keep the chart readable; there are no longer
+    // 8+ crossing lines that turn into an unreadable tangle.
+    const visibleCount = 6;
+    const visible = sorted.slice(0, visibleCount);
+
+    const ref = new Map(); // crop label -> crop object (for tooltips)
+    const datasets = visible.map((crop, idx) => {
         const history30 = interpolateHistory(crop.history || [], 30);
         const color     = palette[idx % palette.length];
+        ref.set(tCrop(crop.crop), crop);
         return {
-            label:                     tCrop(crop.crop),
-            data:                      history30,
-            borderColor:               color,
-            backgroundColor:           color + '18',
-            borderWidth:               idx < 5 ? 2.5 : 1.5,
-            tension:                   0.4,
-            fill:                      idx === 0,
-            pointRadius:               0,
-            pointHoverRadius:          5,
-            pointHoverBackgroundColor: color,
-            hidden:                    idx >= 8,
+            label:           tCrop(crop.crop),
+            data:            history30,
+            borderColor:     color,
+            backgroundColor: color + '14',          // very light fill under the line
+            borderWidth:     2.5,
+            tension:         0.32,                  // gentle smoothing, not noisy
+            fill:            true,
+            pointRadius:     ctx => (ctx.dataIndex === history30.length - 1 ? 4 : 0), // dot on "today"
+            pointHoverRadius: 6,
+            pointBackgroundColor: color,
+            pointBorderColor:     '#0e1510',
+            pointBorderWidth:     2,
         };
     });
+
+    const titleText = `${city} — ${_t('30-Day Price Trend')} (₹/${_t('quintal') || 'quintal'})`;
 
     marketChart = new Chart(canvas, {
         type: 'line',
         data: { labels, datasets },
         options: {
-            ...getBaseChartOptions(
-                `${city} — ${_t('30-Day Price Trend')} (₹/${_t('quintal') || 'quintal'})`
-            ),
+            ...getBaseChartOptions(titleText),
+            interaction: { mode: 'nearest', axis: 'x', intersect: false },
             scales: {
                 x: {
                     grid:   { color: 'rgba(74,222,128,0.05)', drawBorder: false },
@@ -676,10 +648,30 @@ function buildLineChart(canvas, cityData, city) {
                 y: {
                     grid:   { color: 'rgba(74,222,128,0.06)', drawBorder: false },
                     ticks:  {
-                        color:    '#6b8c6c',
-                        callback: v => '₹' + v.toLocaleString('en-IN'),
+                        color:         '#6b8c6c',
+                        maxTicksLimit: 7,
+                        callback:      v => '₹' + v.toLocaleString('en-IN'),
                     },
                     border: { color: 'rgba(74,222,128,0.1)' },
+                },
+            },
+            plugins: {
+                ...getBaseChartOptions(titleText).plugins,
+                tooltip: {
+                    ...getBaseChartOptions(titleText).plugins.tooltip,
+                    callbacks: {
+                        title: items => {
+                            const i = items[0] ? items[0].dataIndex : 0;
+                            return labels[i] || '';
+                        },
+                        label: ctx => {
+                            const crop = ref.get(ctx.dataset.label);
+                            const sign = crop && crop.change >= 0 ? '▲' : '▼';
+                            const chg  = crop ? Math.abs(crop.change).toFixed(1) : '';
+                            return ` ${ctx.dataset.label}: ₹${ctx.raw.toLocaleString('en-IN')}` +
+                                   (crop ? `  ${sign}${chg}%  (${tDemand(crop.demand)})` : '');
+                        },
+                    },
                 },
             },
         },

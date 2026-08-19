@@ -139,7 +139,7 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr));
   gap: 24px;
-  align-items: start;
+  align-items: stretch;
 }
 
 /* City Card */
@@ -150,6 +150,12 @@
   overflow: hidden;
   transition: var(--trans);
   animation: fadeInUp 0.4s ease both;
+  /* Equal-height city cards: each one is an independent scrollable box, so a
+     long crop list scrolls inside its own card and never stretches the grid
+     row (which used to leave empty space beside shorter cards). */
+  display: flex;
+  flex-direction: column;
+  height: 460px;
 }
 .city-card:hover { border-color: var(--border-2); box-shadow: var(--shadow); }
 
@@ -160,11 +166,11 @@
   padding: 18px 20px;
   background: var(--bg-3);
   border-bottom: 1px solid var(--border);
-  cursor: pointer;
+  flex: 0 0 auto;
   user-select: none;
   transition: background 0.2s ease;
 }
-.city-card-header:hover { background: rgba(74,222,128,0.04); }
+/* Scrollable crop rows area — each city card scrolls independently. */
 .city-name {
   display: flex;
   align-items: center;
@@ -198,17 +204,21 @@
 }
 .city-chevron.rotated { transform: rotate(180deg); }
 
-/* Collapsible crop rows wrapper */
+/* Scrollable crop rows wrapper — every city card scrolls independently so a
+   long crop list never distorts the grid layout. */
 .crop-rows-wrapper {
-  max-height: 2000px;
-  overflow: hidden;
-  transition: max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
-  opacity: 1;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
-.crop-rows-wrapper.collapsed {
-  max-height: 0;
-  opacity: 0;
+.crop-rows-wrapper::-webkit-scrollbar { width: 6px; }
+.crop-rows-wrapper::-webkit-scrollbar-track { background: transparent; }
+.crop-rows-wrapper::-webkit-scrollbar-thumb {
+  background: rgba(74, 222, 128, 0.25);
+  border-radius: 50px;
 }
+.crop-rows-wrapper::-webkit-scrollbar-thumb:hover { background: rgba(74, 222, 128, 0.4); }
 
 .crop-rows { padding: 8px 0; }
 .crop-row {
@@ -216,7 +226,9 @@
   grid-template-columns: 1.5fr 1fr 80px 100px;
   align-items: center;
   padding: 11px 20px;
-  border-bottom: 1px solid rgba(74,222,128,0.05);
+  /* Clear, even separator lines between crop rows so the list reads like a
+     clean table inside each independently-scrollable city card. */
+  border-bottom: 1px solid rgba(74, 222, 128, 0.14);
   transition: var(--trans);
   gap: 8px;
 }
@@ -366,6 +378,7 @@
 /* Responsive */
 @media (max-width: 768px) {
   .market-cities-grid { grid-template-columns: 1fr; }
+  .city-card { height: 420px; }
   .crop-row { grid-template-columns: 1fr 1fr; gap: 6px; }
   .cr-demand { display: none; }
   .chart-canvas-wrap { height: 260px; }
