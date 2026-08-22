@@ -1063,7 +1063,7 @@ body.light-theme .kw-rec-hint   { color: #9ca3af; }
 
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
-                addBotMsg('Server error: ' + (err.error || res.status) + '. Please try again.');
+                addBotMsg('Server error: ' + (err.detail || err.error || res.status) + '. Please try again.');
                 isBusy = false;
                 if (sendBtn) sendBtn.disabled = false;
                 if (micBtn) micBtn.disabled = false;

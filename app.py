@@ -2153,16 +2153,21 @@ STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. N
         "stream":      False
     }
     try:
-        resp = requests.post(AI_COMPLETIONS_URL, headers=headers, json=body, timeout=30)
+        # Use the same throttled/retry-aware AI caller the rest of the app
+        # uses, so a transient 429 (Gemini free-tier rate limit) is retried
+        # instead of instantly becoming "AI unavailable".
+        resp = _post_to_ai(body, headers)
         if resp.status_code != 200:
-            return jsonify({"error": "AI unavailable"}), 500
+            logger.warning(f"[Chat] Gemini HTTP {resp.status_code}: {resp.text[:160]}")
+            return jsonify({"error": "AI unavailable", "detail": f"HTTP {resp.status_code}"}), 500
         reply = resp.json()["choices"][0]["message"]["content"].strip()
         if gate_summaries:
             live_block = "📊 Live data:\n" + "\n".join(gate_summaries)
             reply = reply.rstrip() + "\n\n" + live_block
         return jsonify({"reply": reply, "actions": gate_actions})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.warning(f"[Chat] Gemini exception: {e}")
+        return jsonify({"error": "AI unavailable", "detail": str(e)[:200]}), 500
 
 
 # ─── Kisan Helper — Speech-to-Text (Groq Whisper) ────────────────────────────

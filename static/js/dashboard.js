@@ -127,7 +127,6 @@ async function applyDashboardLanguage(langCode) {
         retranslateStaticUI();
         if (window._lastCropData) {
             renderCrops(window._lastCropData);
-            renderCalendar(window._lastCropData.calendar);
             renderPesticides(window._lastCropData.pesticides);
             const label = document.getElementById('seasonLabel');
             if (label && window._lastCropData.season) {
@@ -175,7 +174,6 @@ async function applyDashboardLanguage(langCode) {
     retranslateStaticUI();
     if (window._lastCropData) {
         renderCrops(window._lastCropData);
-        renderCalendar(window._lastCropData.calendar);
         renderPesticides(window._lastCropData.pesticides);
         const label = document.getElementById('seasonLabel');
         if (label && window._lastCropData.season) {
@@ -240,14 +238,17 @@ async function loadWeatherAndCrops(lat, lon) {
     showHeroLoading();
     // Skeleton loaders so the page feels responsive while the AI runs (#9)
     showSkeleton('cropsGrid', 3, 'crop');
-    showSkeleton('calendarTimeline', 2, 'calendar');
+    // NDVI loads independently of OpenWeather — the satellite-vegetation card
+    // only needs lat/lon, so it must still appear even if the weather provider
+    // is unconfigured or temporarily down (previously it was skipped entirely
+    // whenever fetchWeather failed).
+    loadNdvi(lat, lon);            // satellite vegetation health (#1)
     const data = await fetchWeather(lat, lon);
     if (!data) return;
 
     renderHeroCard(data.current);
     renderWeatherSection(data.current, data.forecast);
     renderStatBar(data.current);
-    loadNdvi(lat, lon);            // satellite vegetation health (#1)
     loadCropRecommendations(data.current);
 }
 
@@ -257,6 +258,10 @@ let ndviMap = null;
 async function loadNdvi(lat, lon) {
     const section = document.getElementById('ndviSection');
     if (!section) return;
+    // Show the card immediately (with the built-in "Checking vegetation..."
+    // placeholder) — the first live Sentinel-2 lookup can take up to ~20s,
+    // and the section should never look missing during that wait.
+    section.style.display = '';
     try {
         const res = await fetch(`/api/ndvi?lat=${lat}&lon=${lon}`);
         const data = await res.json();
@@ -472,7 +477,6 @@ async function loadCropRecommendations(current) {
         const data = await res.json();
         window._lastCropData = data; // cache for re-render on language change
         renderCrops(data);
-        renderCalendar(data.calendar);
         renderPesticides(data.pesticides);
 
         const label = document.getElementById('seasonLabel');
@@ -535,57 +539,6 @@ function renderCrops(data) {
   `).join('');
 
     setTimeout(() => observeAnimations(), 100);
-}
-
-/* ── Render advisory calendar ───────────────── */
-function renderCalendar(calendar) {
-    const section = document.getElementById('advisorySection');
-    const timeline = document.getElementById('calendarTimeline');
-    if (!section || !timeline) return;
-    section.style.display = '';
-
-    timeline.innerHTML = calendar.map((item, i) => `
-    <div class="timeline-item" style="animation-delay:${i * 0.05}s">
-      <div class="timeline-dot ${item.type}"></div>
-      <div class="timeline-card">
-        <div class="tc-date">
-          <span>${item.date}</span>
-          <span class="tc-week">${dt('Week')} ${item.week}</span>
-        </div>
-        <div class="tc-activity">
-          <i class="${getActivityIcon(item.type)}" style="margin-right:6px;color:${getActivityColor(item.type)}"></i>
-          ${dt(item.activity)}
-        </div>
-        <span class="tc-type ${item.type}">${dt(item.type)}</span>
-      </div>
-    </div>
-  `).join('');
-}
-
-function getActivityIcon(type) {
-    const icons = {
-        preparation: 'fas fa-shovel',
-        sowing: 'fas fa-seedling',
-        irrigation: 'fas fa-faucet-drip',
-        fertilizer: 'fas fa-flask',
-        maintenance: 'fas fa-scissors',
-        pesticide: 'fas fa-spray-can-sparkles',
-        harvest: 'fas fa-wheat-awn',
-    };
-    return icons[type] || 'fas fa-circle';
-}
-
-function getActivityColor(type) {
-    const colors = {
-        preparation: 'var(--teal)',
-        sowing: 'var(--green)',
-        irrigation: '#38bdf8',
-        fertilizer: 'var(--amber)',
-        maintenance: 'var(--green-2)',
-        pesticide: 'var(--red)',
-        harvest: '#a78bfa',
-    };
-    return colors[type] || 'var(--text-3)';
 }
 
 /* ── Render pesticide guide ─────────────────── */
