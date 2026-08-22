@@ -171,6 +171,15 @@
         <div class="ndvi-status" id="ndviStatus">Checking vegetation...</div>
         <div class="ndvi-meta" id="ndviMeta"></div>
         <div class="ndvi-source" id="ndviSource"></div>
+        <!-- Soil score derived from satellite vegetation + region soil type -->
+        <div class="soil-score-box" id="soilScoreBox" style="display:none">
+          <div class="soil-score-head">
+            <span class="soil-score-label"><i class="fas fa-mound"></i> Soil Health</span>
+            <span class="soil-score-val" id="soilScoreVal">--</span>
+          </div>
+          <div class="soil-score-bar"><div class="soil-score-fill" id="soilScoreFill"></div></div>
+          <div class="soil-score-sub" id="soilScoreSub"></div>
+        </div>
       </div>
     </div>
   </div>

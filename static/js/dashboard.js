@@ -306,6 +306,21 @@ function renderNdvi(data, lat, lon) {
             ? `<span class="badge-live"><i class="fas fa-satellite"></i> Live Sentinel-2</span>`
             : `<span class="badge-estimate"><i class="fas fa-calculator"></i> Estimated (no recent cloud-free satellite scene)</span>`;
     }
+    // Soil score (from satellite vegetation + regional soil type)
+    const soilBox = document.getElementById('soilScoreBox');
+    if (soilBox && typeof data.soil_score === 'number') {
+        soilBox.style.display = '';
+        const sVal = document.getElementById('soilScoreVal');
+        const sFill = document.getElementById('soilScoreFill');
+        const sSub = document.getElementById('soilScoreSub');
+        const s = Math.max(0, Math.min(100, data.soil_score));
+        const sColor = s >= 70 ? 'var(--green)' : s >= 40 ? 'var(--amber)' : 'var(--red)';
+        if (sVal) { sVal.textContent = s + '/100'; sVal.style.color = sColor; }
+        if (sFill) { sFill.style.width = s + '%'; sFill.style.background = sColor; }
+        if (sSub) {
+            sSub.textContent = (data.soil_type ? `${data.soil_type} soil · ` : '') + (data.soil_status || '');
+        }
+    }
     initNdviMap(lat, lon);
 }
 

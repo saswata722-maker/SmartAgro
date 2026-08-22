@@ -564,6 +564,30 @@ def get_ndvi():
     result = get_sentinel2_ndvi(lat, lon)
     if result is None:
         result = estimate_ndvi(lat, lon)
+
+    # ── Soil score (alongside the satellite NDVI) ─────────────────────────
+    # The farmer wants to know: is MY soil healthy enough to grow? Vegetation
+    # vigor from the satellite is the best free proxy for soil condition —
+    # dense, vigorous vegetation implies good soil; bare/eroded patches imply
+    # poor soil. So we derive a transparent 0-100 Soil Score from the NDVI,
+    # and report the area's predominant soil type (from the region resolution).
+    soil_type = resolve_soil_type("", lat, lon, explicit=request.args.get("soil"))
+    ndvi_v    = result.get("ndvi")
+    if ndvi_v is None:
+        soil_score, soil_status = 0, "Unavailable"
+    elif ndvi_v >= 0.6:
+        soil_score, soil_status = 90, "Excellent"
+    elif ndvi_v >= 0.4:
+        soil_score, soil_status = 75, "Good"
+    elif ndvi_v >= 0.2:
+        soil_score, soil_status = 55, "Moderate"
+    elif ndvi_v >= 0.1:
+        soil_score, soil_status = 35, "Poor"
+    else:
+        soil_score, soil_status = 15, "Very Poor / Bare"
+    result["soil_type"]   = soil_type
+    result["soil_score"]  = soil_score
+    result["soil_status"] = soil_status
     return jsonify(result)
 
 
@@ -571,12 +595,16 @@ def get_ndvi():
 # never hammer OpenWeather for the same spot within a few minutes.
 _weather_cache = {}
 _WEATHER_CACHE_TTL = 300  # seconds
+_weather_api_status = None  # (http_status, snippet) of last failed OpenWeather call
+
 
 def _fetch_current_weather(lat, lon):
     """Live OpenWeather current + 7-day forecast. Shared by the /api/weather
     route AND the Kisan Helper feature gateway, so the chatbot's answers are
     built from the exact same data the dashboard shows. Returns the same dict
     shape as /api/weather, or None on any failure / missing API key."""
+    global _weather_api_status
+    _weather_api_status = None
     if not OPENWEATHER_API_KEY:
         return None
 
@@ -593,10 +621,11 @@ def _fetch_current_weather(lat, lon):
             params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "cnt": 56}, timeout=10)
 
         if current_resp.status_code != 200:
-            logger.warning(f"[Weather] Current API error: {current_resp.text}")
+            _weather_api_status = (current_resp.status_code, current_resp.text[:120])
+            logger.warning(f"[Weather] Current API error: {current_resp.text[:160]}")
             return None
         if forecast_resp.status_code != 200:
-            logger.warning(f"[Weather] Forecast API error: {forecast_resp.text}")
+            logger.warning(f"[Weather] Forecast API error: {forecast_resp.text[:160]}")
 
         current_data  = current_resp.json()
         forecast_data = forecast_resp.json()
@@ -666,6 +695,17 @@ def get_weather():
 
     weather = _fetch_current_weather(lat, lon)
     if weather is None:
+        # Distinguish rate-limit / auth failures from generic outages so the
+        # farmer (and the UI) sees an honest reason instead of "unavailable".
+        status, snippet = (_weather_api_status or (None, ""))
+        if status == 429:
+            return jsonify({
+                "error":       "Weather API rate limit reached. Please try again shortly.",
+                "limit_reached": True,
+                "detail":      "OpenWeather returned HTTP 429 — free-tier quota exhausted for now.",
+            }), 429
+        if status == 401:
+            return jsonify({"error": "Weather API key rejected (HTTP 401). Check OPENWEATHER_API_KEY in .env."}), 500
         return jsonify({"error": "Weather service unavailable right now. Please try again in a moment."}), 500
     return jsonify(weather)
 
@@ -675,7 +715,7 @@ _crop_ai_cache = {}
 CROP_AI_CACHE_TTL_SEC = 3 * 60 * 60  # 3 hours — same city/season/weather bucket repeats a lot in a day
 
 
-def ai_recommend_crops(city, lat, lon, temp, humidity, rain, season):
+def ai_recommend_crops(city, lat, lon, temp, humidity, rain, season, soil_type=None):
     """Ask Groq for crops genuinely suited to THIS location's climate, soil
     region and season — instead of matching generic temp/humidity bands
     against a fixed table.
@@ -684,7 +724,7 @@ def ai_recommend_crops(city, lat, lon, temp, humidity, rain, season):
     if not GROQ_API_KEY:
         return None
 
-    cache_key = f"{city}|{round((lat or 0), 1)}|{round((lon or 0), 1)}|{season}|{round(temp/3)*3}|{round(humidity/10)*10}"
+    cache_key = f"{city}|{round((lat or 0), 1)}|{round((lon or 0), 1)}|{season}|{round(temp/3)*3}|{round(humidity/10)*10}|{soil_type or ''}"
     now = time.monotonic()
     cached = _crop_ai_cache.get(cache_key)
     if cached and (now - cached[0]) < CROP_AI_CACHE_TTL_SEC:
@@ -695,6 +735,7 @@ def ai_recommend_crops(city, lat, lon, temp, humidity, rain, season):
 Location: {city or "an unspecified Indian town"} (approx. lat {lat}, lon {lon})
 Current season: {season}
 Current weather right now: {temp} deg C, {humidity}% humidity, {rain} mm recent rainfall
+Predominant soil type in this area: {soil_type or "unknown (check locally)"}
 
 Recommend the 6 crops BEST suited to THIS exact location's climate, soil
 region and season — not a generic list. Use your knowledge of Indian
@@ -703,7 +744,9 @@ alluvial soil in the Indo-Gangetic plain, laterite soil along the Western
 Ghats/coastal belts, arid/sandy soil in Rajasthan, red soil in the Deccan
 plateau, etc.) to pick realistic, regionally-appropriate crops that a real
 agricultural officer would suggest for this place right now, ranked by
-suitability.
+suitability. Take the "Predominant soil type" above as a HARD constraint:
+skip crops that need a totally different soil family (e.g. rice/alluvial
+vs black-cotton-only crops).
 
 Respond ONLY with a JSON object, no preamble, no markdown fences, matching
 exactly this shape:
@@ -765,12 +808,16 @@ def crop_recommendations():
     lat      = data.get("lat")
     lon      = data.get("lon")
     season   = get_season(datetime.now().month)
+    # Soil type is derived from the location (state → known agro-climatic
+    # zone), or taken directly from the client if it was sent (e.g. chosen
+    # from the UI or from a soil-lab test) — that explicit value wins.
+    soil_type = resolve_soil_type(city, lat, lon, explicit=data.get("soil"))
 
-    ai_crops = ai_recommend_crops(city, lat, lon, temp, humidity, rain, season)
+    ai_crops = ai_recommend_crops(city, lat, lon, temp, humidity, rain, season, soil_type)
     if ai_crops:
         crops, source = ai_crops, "ai"
     else:
-        crops, source = recommend_crops(temp, humidity, rain, season), "rule_based"
+        crops, source = recommend_crops(temp, humidity, rain, season, soil_type), "rule_based"
 
     calendar = generate_advisory_calendar(crops[:3])
     return jsonify({
@@ -778,7 +825,8 @@ def crop_recommendations():
         "crops":      crops,
         "calendar":   calendar,
         "pesticides": get_pesticide_guide(crops[:3]),
-        "source":     source,   # "ai" = location-aware, "rule_based" = offline fallback
+        "source":     source,      # "ai" = location-aware, "rule_based" = offline fallback
+        "soil":       soil_type,   # the soil family this recommendation used
     })
 
 
@@ -791,7 +839,7 @@ def get_season(month):
         return "Zaid (Summer)"
 
 
-def recommend_crops(temp, humidity, rain, season):
+def recommend_crops(temp, humidity, rain, season, soil_type=None):
     all_crops = [
         {"name":"Rice","icon":"🌾","temp_range":(20,38),"humidity_range":(70,100),"rain_min":15,"season":"Kharif (Monsoon)","water":"High","yield":"3-5 tonnes/ha","profit":"Rs45,000-65,000/ha","duration":"90-150 days","description":"Ideal for high humidity and warm monsoon conditions","soil":"Clay loam, alluvial","fertilizer":"NPK 120:60:60 kg/ha"},
         {"name":"Wheat","icon":"🌿","temp_range":(10,25),"humidity_range":(40,65),"rain_min":0,"season":"Rabi (Winter)","water":"Medium","yield":"4-6 tonnes/ha","profit":"Rs50,000-75,000/ha","duration":"100-150 days","description":"Best suited for cool, dry winters","soil":"Well-drained loam","fertilizer":"NPK 120:60:40 kg/ha"},
@@ -847,6 +895,18 @@ def recommend_crops(temp, humidity, rain, season):
             score += 20
         else:
             score += 5
+
+        # 5. Soil match score (max 12) — the crop will thrive only if the
+        #    soil family it needs is the one actually present nearby. A crop
+        #    listing the exact local soil gets the full 12; a loam-ish match
+        #    still gets partial credit since loam is compatible with most.
+        if soil_type:
+            soil_text = (crop.get("soil") or "").lower()
+            keywords = SOIL_KEYWORDS.get(soil_type, [])
+            if any(k in soil_text for k in keywords):
+                score += 12
+            elif any(k in soil_text for k in SOIL_KEYWORDS.get("Loam", [])):
+                score += 6
 
         crop["score"] = min(98, score)
         crop["match"] = f"{crop['score']}%"
@@ -1079,6 +1139,80 @@ CITY_STATE = {
     "Guwahati":      "Assam",
     "Amritsar":      "Punjab",
 }
+
+# ── Soil type for crop recommendations ────────────────────────────────────────
+# Predominant soil family per state (Indian agro-climatic zones). Used together
+# with live weather to recommend the crops best suited to BOTH the current
+# conditions AND the actual soil of the farmer's region. Deterministic + free:
+# no external API needed, works offline, and a caller may override with an
+# explicit `soil_type` (e.g. from a soil lab test) which always wins.
+SOIL_BY_STATE = {
+    "Punjab":          "Alluvial",
+    "Haryana":         "Alluvial",
+    "Uttar Pradesh":   "Alluvial",
+    "Bihar":           "Alluvial",
+    "West Bengal":     "Alluvial",
+    "Assam":           "Alluvial",
+    "Delhi":           "Alluvial",
+    "Maharashtra":     "Black cotton",
+    "Madhya Pradesh":  "Black",
+    "Telangana":       "Red",
+    "Andhra Pradesh":  "Red",
+    "Karnataka":       "Red",
+    "Tamil Nadu":      "Red",
+    "Kerala":          "Laterite",
+    "Goa":             "Laterite",
+    "Rajasthan":       "Arid sandy",
+    "Gujarat":         "Black",
+    "Odisha":          "Laterite",
+    "Himachal Pradesh": "Mountain loamy",
+    "Uttarakhand":      "Mountain loamy",
+    "Jammu & Kashmir":  "Mountain loamy",
+}
+
+# Soil keywords recognized inside each crop's `soil` field. When a crop lists
+# one of these for the same family as the location's soil, it gets a soil
+# match bonus in the rule-based recommender.
+SOIL_KEYWORDS = {
+    "Alluvial":      ["alluvial", "alluv"],
+    "Black":         ["black", "regur", "cotton soil", "deep black"],
+    "Red":           ["red", "red loam", "red soil"],
+    "Laterite":      ["laterite"],
+    "Sandy/Desert":  ["sandy", "sand", "arid", "light sandy"],
+    "Loam":          ["loam", "loamy", "loess"],
+    "Clay":          ["clay"],
+    "Mountain":      ["loess", "mountain", "hill"],
+}
+
+
+def resolve_soil_type(city, lat, lon, explicit=None):
+    """Determine the predominant soil type for a location. Priority:
+       1. explicit soil_type passed by the caller (e.g. a soil lab report),
+       2. the state for the nearest known city in CITY_STATE,
+       3. a coarse lat/lon band fallback for unknown spots.
+    Returns a canonical string like 'Alluvial', 'Black', 'Red', 'Laterite',
+    'Sandy/Desert', 'Loam', 'Mountain loamy', or '' (unknown)."""
+    if explicit and isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().title()
+    state = CITY_STATE.get((city or "").strip().title(), "")
+    if state and state in SOIL_BY_STATE:
+        return SOIL_BY_STATE[state]
+    # Coarse point-in-landmass fallback using broad Indian soil regions.
+    # (Only hit when the city is unknown/empty.)
+    try:
+        lat_v = float(lat) if lat is not None else None
+        lon_v = float(lon) if lon is not None else None
+    except (TypeError, ValueError):
+        lat_v = lon_v = None
+    if lat_v is None or lon_v is None:
+        return ""
+    if 8.0 <= lat_v <= 15.0 and 72.0 <= lon_v <= 80.0:
+        return "Red"            # South-Central Deccan
+    if 15.0 < lat_v <= 22.0 and 75.0 <= lon_v <= 80.0:
+        return "Black"          # Deccan plateau (black cotton)
+    if 11.0 <= lat_v <= 20.0 and lon_v >= 80.0:
+        return "Laterite"       # east coast
+    return ""
 
 # Real daily price history, built up one genuine data point per day as the
 # app runs (no fabricated numbers). Persisted to disk so it survives restarts.
@@ -1595,8 +1729,13 @@ def _chat_message_on_topic(text: str) -> bool:
         "max_tokens": 32,
     }
     try:
-        resp = requests.post(AI_COMPLETIONS_URL, headers=headers, json=body, timeout=8)
+        # Route through the shared throttled/retry-aware caller so a transient
+        # Gemini 429 (free-tier quota) is retried with backoff instead of
+        # instantly failing the gate. On persistent failure we FAIL OPEN so a
+        # rate-limit blip never blocks a real farmer's question.
+        resp = _post_to_ai(body, headers)
         if resp.status_code != 200:
+            logger.info(f"[TopicGate] classifier HTTP {resp.status_code} — fail open")
             return True  # fail open
         parsed = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         parsed = re.sub(r"```(?:json)?", "", parsed).replace("```", "").strip()
@@ -1829,10 +1968,12 @@ def _chat_alerts_tool(lat, lon):
 
 def _chat_crops_tool(lat, lon, city):
     season = get_season(datetime.now().month)
+    soil_type = resolve_soil_type(city, lat, lon)
     if not lat or not lon:
-        base = recommend_crops(25, 60, 0, season)
+        base = recommend_crops(25, 60, 0, season, soil_type)
         return {
             "ok": True, "season": season, "city": city or "your area",
+            "soil": soil_type,
             "crops": [{"name": c.get("name"), "match": c.get("match")}
                       for c in (base or [])][:6],
         }
@@ -1841,11 +1982,12 @@ def _chat_crops_tool(lat, lon, city):
     do_hum  = float(w["current"]["humidity"]) if w else 60
     do_rain = float(w["current"].get("rain") or 0) if w else 0
     crops = ai_recommend_crops(city or "", float(lat), float(lon),
-                                do_temp, do_hum, do_rain, season)
+                                do_temp, do_hum, do_rain, season, soil_type)
     if not crops:
-        crops = recommend_crops(do_temp, do_hum, do_rain, season) or []
+        crops = recommend_crops(do_temp, do_hum, do_rain, season, soil_type) or []
     return {
         "ok": True, "season": season, "city": city or "",
+        "soil": soil_type,
         "crops": [{"name": c.get("name"), "match": c.get("match"),
                     "description": c.get("description")}
                   for c in crops[:6] if isinstance(c, dict)],
@@ -2157,6 +2299,15 @@ STYLE: Keep answers practical, simple, and farmer-friendly. Use bullet points. N
         # uses, so a transient 429 (Gemini free-tier rate limit) is retried
         # instead of instantly becoming "AI unavailable".
         resp = _post_to_ai(body, headers)
+        if resp.status_code == 429:
+            # All 429 retries exhausted — tell the farmer honestly and let the
+            # UI show a "try again shortly" hint instead of a generic failure.
+            logger.warning(f"[Chat] Gemini rate limited after retries for {ip}")
+            return jsonify({
+                "error":       "The AI assistant is getting too many requests right now. Please try again in a few seconds.",
+                "rate_limited": True,
+                "detail":      "Gemini returned HTTP 429 even after automatic retries.",
+            }), 429
         if resp.status_code != 200:
             logger.warning(f"[Chat] Gemini HTTP {resp.status_code}: {resp.text[:160]}")
             return jsonify({"error": "AI unavailable", "detail": f"HTTP {resp.status_code}"}), 500
@@ -2251,6 +2402,35 @@ def _is_rate_limited_diagnose(ip: str) -> bool:
     return not _rate_limit("diagnose", ip, DIAGNOSE_LIMIT)
 
 
+# ── Rate-limit (HTTP 429) resilience for Groq vision calls ────────────────
+# Free/limited AI tiers frequently return HTTP 429 "rate limit exceeded". Every
+# vision call (the pre-classifier + each diagnosis ensemble pass) retries with
+# exponential backoff and honors the server's Retry-After header, so a transient
+# quota blip never silently kills a diagnosis pass.
+def _groq_vision_post(url, headers, payload, timeout=45):
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.RequestException as e:
+            if attempt < 2:
+                logger.warning(f"[GroqVision] request error (retry {attempt + 1}): {e}")
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+        if resp.status_code != 429:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            wait = float(retry_after) if retry_after else (1.0 * (attempt + 1))
+        except (TypeError, ValueError):
+            wait = 1.0 * (attempt + 1)
+        if attempt < 2:
+            logger.info(f"[GroqVision] HTTP 429 — retrying in {wait:.1f}s")
+            time.sleep(min(wait, 8))
+    return resp
+
+
 # ── Step 0: cheap pre-classifier ─────────────────────────────────────────
 def ai_is_crop_image(image_b64):
     """Fast, low-token sanity check BEFORE running the full diagnosis
@@ -2283,9 +2463,10 @@ def ai_is_crop_image(image_b64):
         "reasoning_effort": "none",
     }
     try:
-        resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                              headers=headers, json=body, timeout=15)
+        resp = _groq_vision_post("https://api.groq.com/openai/v1/chat/completions",
+                                  headers, body, timeout=15)
         if resp.status_code != 200:
+            logger.warning(f"[PreClassifier] Groq HTTP {resp.status_code} — fail open")
             return True, None  # fail open — don't block a real diagnosis on a classifier hiccup
         raw = resp.json()["choices"][0]["message"]["content"].strip()
         cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -2316,8 +2497,8 @@ def _run_vision_pass(image_b64, prompt, sys_prompt, model, temperature):
         "max_tokens": 1400,
         "reasoning_effort": "none",  # skip <think> mode so JSON lands directly in content
     }
-    resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                          headers=headers, json=body, timeout=45)
+    resp = _groq_vision_post("https://api.groq.com/openai/v1/chat/completions",
+                              headers, body, timeout=45)
     if resp.status_code != 200:
         return None
     raw = resp.json()["choices"][0]["message"]["content"].strip()

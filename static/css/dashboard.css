@@ -534,6 +534,15 @@
 .ndvi-meta { font-size: 0.78rem; color: var(--text-3); }
 .ndvi-source .badge-live    { color: var(--green); font-size: 0.72rem; font-weight: 700; }
 .ndvi-source .badge-estimate{ color: var(--amber); font-size: 0.72rem; font-weight: 600; }
+/* Soil score box inside the NDVI card */
+.soil-score-box { width: 100%; margin-top: 6px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: rgba(74,222,128,0.04); }
+.soil-score-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.soil-score-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-2); }
+.soil-score-label i { color: var(--amber); margin-right: 5px; }
+.soil-score-val { font-size: 0.95rem; font-weight: 800; font-family: 'Syne', sans-serif; }
+.soil-score-bar { height: 6px; border-radius: 50px; background: rgba(74,222,128,0.12); overflow: hidden; }
+.soil-score-fill { height: 100%; border-radius: 50px; transition: width 1s cubic-bezier(0.4,0,0.2,1); }
+.soil-score-sub { margin-top: 6px; font-size: 0.7rem; color: var(--text-3); }
 @media (max-width: 860px) { .ndvi-layout { grid-template-columns: 1fr; } }
 
   .forecast-card { padding: 12px 8px; }

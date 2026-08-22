@@ -1063,7 +1063,13 @@ body.light-theme .kw-rec-hint   { color: #9ca3af; }
 
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
-                addBotMsg('Server error: ' + (err.detail || err.error || res.status) + '. Please try again.');
+                if (res.status === 429 || err.rate_limited || err.limit_reached) {
+                    // Rate limited (per-IP limit OR upstream AI quota) — honest,
+                    // friendly retry message instead of a scary server error.
+                    addBotMsg('⏳ ' + (err.error || 'Too many requests right now. Please wait a few seconds and ask again.'));
+                } else {
+                    addBotMsg('Server error: ' + (err.detail || err.error || res.status) + '. Please try again.');
+                }
                 isBusy = false;
                 if (sendBtn) sendBtn.disabled = false;
                 if (micBtn) micBtn.disabled = false;
